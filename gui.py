@@ -3,7 +3,7 @@ import socket
 import json
 import numpy as np
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 import subprocess
 import psutil
@@ -13,28 +13,28 @@ import os
 HOST = "127.0.0.1"
 PORT = 8888
 
-# 拍手
-HAND_CLOSE_THRESH = 0.35
-HAND_OPEN_THRESH = 0.45
-STATE_APART = "apart"
-STATE_CLAP = "clap"
+# 测试类型枚举（和后端对应）
+TEST_CLAP = 0
+TEST_SQUAT = 1
+TEST_FACE = 2
 
-# 深蹲
-SQUAT_THRESHOLD = 0.08
-STATE_STAND = "stand"
-STATE_SQUAT = "squat"
+# 命令码（和后端对应，从0x80开始，避免和图像模式0/1冲突）
+CMD_START_TEST = 0x81
+CMD_STOP_TEST = 0x82
+CMD_GET_RECORDS = 0x83
+CMD_CLEAR_RECORDS = 0x84
 
-# ========== 【新配色，背景绿色 + 多彩卡片】 ==========
-COLOR_BG = "#e6f9e9"          # 整体背景：浅薄荷绿
+# ========== 配色 ==========
+COLOR_BG = "#e6f9e9"
 COLOR_CARD = "#ffffff"
-# 四个卡片主题色
-CARD1_MAIN = "#22c55e"   # 拍手：绿色
-CARD2_MAIN = "#3b82f6"   # 深蹲：蓝色
-CARD3_MAIN = "#ec4899"   # 颜值：玫红
-CARD4_MAIN = "#f97316"   # 记录：橙色
+CARD1_MAIN = "#22c55e"
+CARD2_MAIN = "#3b82f6"
+CARD3_MAIN = "#ec4899"
+CARD4_MAIN = "#f97316"
 COLOR_TEXT = "#1e293b"
 COLOR_GRAY = "#64748b"
 COLOR_SHADOW = "#c2e8c7"
+
 
 def get_resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -42,6 +42,7 @@ def get_resource_path(relative_path):
     else:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 class MainApp(tk.Tk):
     def __init__(self):
@@ -51,9 +52,9 @@ class MainApp(tk.Tk):
         self.resizable(True, True)
         self.configure(bg=COLOR_BG)
         self.server_proc = None
-        # 启动后端server
+        self.sock = None
+
         self.start_backend()
-        # 等待后端启动再连接
         self.after(800, self.connect_server)
 
         self.container = tk.Frame(self, bg=COLOR_BG)
@@ -62,23 +63,20 @@ class MainApp(tk.Tk):
         self.container.grid_columnconfigure(0, weight=1)
 
         self.frames = {}
-        for F in (HomePage, ClapTestPage, SquatTestPage, FaceScorePage):
+        for F in (HomePage, ClapTestPage, SquatTestPage, FaceScorePage, RecordPage):
             frame = F(self.container, self)
             self.frames[F] = frame
             frame.grid(row=0, column=0, sticky="nsew")
 
         self.show_frame(HomePage)
-        # 窗口关闭事件：杀掉后端
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def start_backend(self):
         server_py = get_resource_path("server.py")
-        # 打包后，在同目录下的server.exe
         exe_path = get_resource_path("server.exe")
         if os.path.exists(exe_path):
             self.server_proc = subprocess.Popen([exe_path], creationflags=subprocess.CREATE_NO_WINDOW)
         else:
-            # 开发环境，直接python跑
             self.server_proc = subprocess.Popen([sys.executable, server_py])
 
     def connect_server(self):
@@ -86,6 +84,7 @@ class MainApp(tk.Tk):
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(2.0)
             self.sock.connect((HOST, PORT))
+            self.sock.settimeout(None)
         except Exception:
             self.sock = None
             messagebox.showerror("错误", "后端推理服务启动失败！")
@@ -93,12 +92,60 @@ class MainApp(tk.Tk):
     def show_frame(self, page_class):
         frame = self.frames[page_class]
         frame.tkraise()
+        # 记录页显示时自动刷新
+        if page_class == RecordPage:
+            frame.refresh()
 
     def get_socket(self):
         return self.sock
 
+    # ========== 统一通信方法 ==========
+    def send_command(self, cmd_byte, extra_bytes=None):
+        """发送命令帧，返回后端JSON响应"""
+        sock = self.sock
+        if sock is None:
+            return {"success": False, "message": "服务未连接"}
+        try:
+            sock.sendall(bytes([cmd_byte]))
+            if extra_bytes:
+                sock.sendall(extra_bytes)
+            return self.recv_json()
+        except Exception as e:
+            print(f"命令发送异常: {e}")
+            return {"success": False, "message": str(e)}
+
+    def send_image_frame(self, mode_byte, frame):
+        """发送图像帧，返回后端JSON响应"""
+        sock = self.sock
+        if sock is None:
+            return {"success": False, "landmarks": [], "tip": "服务未连接", "count": 0, "score": None}
+        try:
+            success, buf = cv2.imencode(".jpg", frame)
+            if not success:
+                return {"success": False, "landmarks": [], "tip": "编码失败", "count": 0, "score": None}
+            img_bytes = buf.tobytes()
+            sock.sendall(bytes([mode_byte]))
+            sock.sendall(len(img_bytes).to_bytes(4, byteorder="big"))
+            sock.sendall(img_bytes)
+            return self.recv_json()
+        except Exception as e:
+            print(f"图像发送异常: {e}")
+            return None
+
+    def recv_json(self):
+        """接收一行JSON响应"""
+        sock = self.sock
+        raw = b""
+        while True:
+            c = sock.recv(1)
+            if c == b"\n" or not c:
+                break
+            raw += c
+        if raw:
+            return json.loads(raw.decode("utf-8"))
+        return {"success": False}
+
     def on_close(self):
-        # 关闭GUI，杀掉server进程
         if self.server_proc is not None:
             try:
                 proc = psutil.Process(self.server_proc.pid)
@@ -108,6 +155,7 @@ class MainApp(tk.Tk):
             except:
                 pass
         self.destroy()
+
 
 # ---------------------- 主页 ----------------------
 class HomePage(tk.Frame):
@@ -143,12 +191,11 @@ class HomePage(tk.Frame):
         card_wrap.grid_columnconfigure(0, weight=1)
         card_wrap.grid_columnconfigure(1, weight=1)
 
-        # 【多彩卡片配置】每个卡片独立颜色
         button_info = [
             {"icon": "👏", "text": "拍手计数测试", "cmd": lambda: controller.show_frame(ClapTestPage), "color": CARD1_MAIN},
             {"icon": "🏃", "text": "深蹲计数测试", "cmd": lambda: controller.show_frame(SquatTestPage), "color": CARD2_MAIN},
             {"icon": "✨", "text": "颜值比例测评", "cmd": lambda: controller.show_frame(FaceScorePage), "color": CARD3_MAIN},
-            {"icon": "📋", "text": "我的记录", "cmd": lambda: self.show_tip("我的记录，开发中..."), "color": CARD4_MAIN},
+            {"icon": "📋", "text": "我的记录", "cmd": lambda: controller.show_frame(RecordPage), "color": CARD4_MAIN},
         ]
 
         for idx, item in enumerate(button_info):
@@ -179,15 +226,12 @@ class HomePage(tk.Frame):
         bottom_label.grid(row=2, column=0, sticky="s")
 
     def darken_color(self, hex_color):
-        # 简单加深颜色，用于hover
         c = hex_color.lstrip("#")
-        r = max(0, int(c[0:2],16)-30)
-        g = max(0, int(c[2:4],16)-30)
-        b = max(0, int(c[4:6],16)-30)
+        r = max(0, int(c[0:2], 16) - 30)
+        g = max(0, int(c[2:4], 16) - 30)
+        b = max(0, int(c[4:6], 16) - 30)
         return f"#{r:02x}{g:02x}{b:02x}"
 
-    def show_tip(self, msg):
-        messagebox.showinfo("提示", msg)
 
 # ---------------------- 拍手页面 ----------------------
 class ClapTestPage(tk.Frame):
@@ -195,8 +239,6 @@ class ClapTestPage(tk.Frame):
         super().__init__(parent, bg=COLOR_BG)
         self.controller = controller
         self.is_running = False
-        self.state = STATE_APART
-        self.clap_count = 0
         self.cap = None
         self.imgtk = None
 
@@ -254,14 +296,14 @@ class ClapTestPage(tk.Frame):
         if self.is_running or sock is None:
             messagebox.showwarning("警告", "推理服务未就绪！")
             return
+        # 通知后端开始拍手测试
+        self.controller.send_command(CMD_START_TEST, bytes([TEST_CLAP]))
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             messagebox.showerror("错误", "摄像头打开失败")
             return
         self.is_running = True
-        self.state = STATE_APART
-        self.clap_count = 0
-        self.info_label.config(text=f"拍手总数：{self.clap_count}")
+        self.info_label.config(text="拍手总数：0")
         self.update_frame()
 
     def stop_capture(self):
@@ -269,9 +311,10 @@ class ClapTestPage(tk.Frame):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        print("\n===== 拍手测试结束 =====")
-        print(f"拍手总次数：{self.clap_count}")
-        self.info_label.config(text=f"拍手总数：{self.clap_count}")
+        # 通知后端结束测试（后端自动保存记录）
+        if self.controller.get_socket() is not None:
+            self.controller.send_command(CMD_STOP_TEST)
+        print("===== 拍手测试结束 =====")
 
     def update_frame(self):
         if not self.is_running:
@@ -280,51 +323,18 @@ class ClapTestPage(tk.Frame):
         if not ret:
             self.stop_capture()
             return
-        sock = self.controller.get_socket()
-        tip_text = "未检测人体"
-        dist = 0.0
-        try:
-            success, buf = cv2.imencode(".jpg", frame)
-            img_bytes = buf.tobytes()
-            # 模式0 = Pose
-            sock.sendall(b"\x00")
-            sock.sendall(len(img_bytes).to_bytes(4, byteorder="big"))
-            sock.sendall(img_bytes)
 
-            raw = b""
-            while True:
-                c = sock.recv(1)
-                if c == b"\n" or not c:
-                    break
-                raw += c
-            if raw:
-                res = json.loads(raw.decode("utf-8"))
-                if res["success"]:
-                    lm = res["landmarks"]
-                    if len(lm) >= 17:
-                        rw = lm[15]
-                        lw = lm[16]
-                        dist = np.sqrt((rw["x"] - lw["x"]) ** 2 + (rw["y"] - lw["y"]) ** 2)
-                        tip_text = f"距离:{dist:.3f}"
-                        if self.state == STATE_APART:
-                            if dist < HAND_CLOSE_THRESH:
-                                self.state = STATE_CLAP
-                        elif self.state == STATE_CLAP:
-                            if dist > HAND_OPEN_THRESH:
-                                self.clap_count += 1
-                                tip_text = "👏拍手成功！"
-                                print(f"👏拍手，当前总数：{self.clap_count}")
-                                self.info_label.config(text=f"拍手总数：{self.clap_count}")
-                                self.state = STATE_APART
-                    else:
-                        tip_text = "手部关键点丢失"
-        except Exception as e:
-            print(f"通信异常：{e}")
+        # 发送图像，后端返回结果
+        res = self.controller.send_image_frame(0, frame)
+        if res is None:
             self.stop_capture()
             return
 
+        tip_text = res.get("tip", "未检测人体")
+        count = res.get("count", 0)
+        self.info_label.config(text=f"拍手总数：{count}")
+
         cv2.putText(frame, tip_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(frame, f"距离:{dist:.3f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
         w = self.img_label.winfo_width()
         h = self.img_label.winfo_height()
@@ -337,14 +347,13 @@ class ClapTestPage(tk.Frame):
 
         self.after(15, self.update_frame)
 
+
 # ---------------------- 深蹲页面 ----------------------
 class SquatTestPage(tk.Frame):
     def __init__(self, parent, controller: MainApp):
         super().__init__(parent, bg=COLOR_BG)
         self.controller = controller
         self.is_running = False
-        self.state = STATE_STAND
-        self.squat_count = 0
         self.cap = None
         self.imgtk = None
 
@@ -402,14 +411,14 @@ class SquatTestPage(tk.Frame):
         if self.is_running or sock is None:
             messagebox.showwarning("警告", "推理服务未就绪！")
             return
+        # 通知后端开始深蹲测试
+        self.controller.send_command(CMD_START_TEST, bytes([TEST_SQUAT]))
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             messagebox.showerror("错误", "摄像头打开失败")
             return
         self.is_running = True
-        self.state = STATE_STAND
-        self.squat_count = 0
-        self.info_label.config(text=f"深蹲总数：{self.squat_count}")
+        self.info_label.config(text="深蹲总数：0")
         self.update_frame()
 
     def stop_capture(self):
@@ -417,9 +426,10 @@ class SquatTestPage(tk.Frame):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        print("\n===== 深蹲测试结束 =====")
-        print(f"深蹲总次数：{self.squat_count}")
-        self.info_label.config(text=f"深蹲总数：{self.squat_count}")
+        # 通知后端结束测试（后端自动保存记录）
+        if self.controller.get_socket() is not None:
+            self.controller.send_command(CMD_STOP_TEST)
+        print("===== 深蹲测试结束 =====")
 
     def update_frame(self):
         if not self.is_running:
@@ -428,50 +438,15 @@ class SquatTestPage(tk.Frame):
         if not ret:
             self.stop_capture()
             return
-        sock = self.controller.get_socket()
-        tip_text = "未检测人体"
-        try:
-            success, buf = cv2.imencode(".jpg", frame)
-            img_bytes = buf.tobytes()
-            sock.sendall(b"\x00")
-            sock.sendall(len(img_bytes).to_bytes(4, byteorder="big"))
-            sock.sendall(img_bytes)
 
-            raw = b""
-            while True:
-                c = sock.recv(1)
-                if c == b"\n" or not c:
-                    break
-                raw += c
-            if raw:
-                res = json.loads(raw.decode("utf-8"))
-                if res["success"]:
-                    lm = res["landmarks"]
-                    if len(lm) >= 27:
-                        l_hip = lm[23]
-                        r_hip = lm[24]
-                        l_knee = lm[25]
-                        r_knee = lm[26]
-                        hip_y = (l_hip["y"] + r_hip["y"]) / 2
-                        knee_y = (l_knee["y"] + r_knee["y"]) / 2
-                        tip_text = f"髋y:{hip_y:.3f},膝y:{knee_y:.3f}"
-
-                        if self.state == STATE_STAND:
-                            if knee_y > hip_y + SQUAT_THRESHOLD:
-                                self.state = STATE_SQUAT
-                        elif self.state == STATE_SQUAT:
-                            if knee_y < hip_y - SQUAT_THRESHOLD:
-                                self.squat_count += 1
-                                tip_text = "✅深蹲完成！"
-                                print(f"✅深蹲，当前总数：{self.squat_count}")
-                                self.info_label.config(text=f"深蹲总数：{self.squat_count}")
-                                self.state = STATE_STAND
-                    else:
-                        tip_text = "关键点缺失"
-        except Exception as e:
-            print(f"通信异常：{e}")
+        res = self.controller.send_image_frame(0, frame)
+        if res is None:
             self.stop_capture()
             return
+
+        tip_text = res.get("tip", "未检测人体")
+        count = res.get("count", 0)
+        self.info_label.config(text=f"深蹲总数：{count}")
 
         cv2.putText(frame, tip_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
@@ -485,6 +460,7 @@ class SquatTestPage(tk.Frame):
             self.img_label.config(image=self.imgtk)
 
         self.after(15, self.update_frame)
+
 
 # ---------------------- 颜值评分页面 ----------------------
 class FaceScorePage(tk.Frame):
@@ -549,6 +525,8 @@ class FaceScorePage(tk.Frame):
         if self.is_running or sock is None:
             messagebox.showwarning("警告", "推理服务未就绪！")
             return
+        # 通知后端开始颜值测评
+        self.controller.send_command(CMD_START_TEST, bytes([TEST_FACE]))
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             messagebox.showerror("错误", "摄像头打开失败")
@@ -562,31 +540,11 @@ class FaceScorePage(tk.Frame):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        print("\n===== 面部测评结束 =====")
+        # 通知后端结束测试（后端自动保存记录）
+        if self.controller.get_socket() is not None:
+            self.controller.send_command(CMD_STOP_TEST)
+        print("===== 面部测评结束 =====")
         self.info_label.config(text="颜值分数：--")
-
-    def calc_face_score(self, lm):
-        if len(lm) < 300:
-            return None
-        forehead = lm[10]
-        nose = lm[1]
-        chin = lm[152]
-        reye = lm[33]
-        leye = lm[263]
-        rmouth = lm[61]
-        lmouth = lm[291]
-
-        h1 = abs(nose["y"] - forehead["y"])
-        h2 = abs(chin["y"] - nose["y"])
-        ratio_three = h1 / h2 if h2 > 1e-6 else 1
-        score_three = max(0, 100 - abs(ratio_three - 1) * 60)
-
-        eye_sym = abs(reye["y"] - leye["y"])
-        mouth_sym = abs(rmouth["y"] - lmouth["y"])
-        sym_score = max(0, 100 - (eye_sym + mouth_sym) * 250)
-
-        total = 0.5 * score_three + 0.5 * sym_score
-        return np.clip(total, 0, 100)
 
     def update_frame(self):
         if not self.is_running:
@@ -595,36 +553,16 @@ class FaceScorePage(tk.Frame):
         if not ret:
             self.stop_capture()
             return
-        sock = self.controller.get_socket()
-        tip_text = "未检测人脸"
-        try:
-            success, buf = cv2.imencode(".jpg", frame)
-            img_bytes = buf.tobytes()
-            # 模式1 = FaceMesh
-            sock.sendall(b"\x01")
-            sock.sendall(len(img_bytes).to_bytes(4, byteorder="big"))
-            sock.sendall(img_bytes)
 
-            raw = b""
-            while True:
-                c = sock.recv(1)
-                if c == b"\n" or not c:
-                    break
-                raw += c
-            if raw:
-                res = json.loads(raw.decode("utf-8"))
-                if res["success"]:
-                    lm = res["landmarks"]
-                    score = self.calc_face_score(lm)
-                    if score is not None:
-                        tip_text = f"分数：{score:.1f}"
-                        self.info_label.config(text=f"颜值分数：{score:.1f}")
-                    else:
-                        tip_text = "人脸关键点不足"
-        except Exception as e:
-            print(f"通信异常：{e}")
+        res = self.controller.send_image_frame(1, frame)
+        if res is None:
             self.stop_capture()
             return
+
+        tip_text = res.get("tip", "未检测人脸")
+        score = res.get("score")
+        if score is not None:
+            self.info_label.config(text=f"颜值分数：{score:.1f}")
 
         cv2.putText(frame, tip_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
@@ -638,6 +576,81 @@ class FaceScorePage(tk.Frame):
             self.img_label.config(image=self.imgtk)
 
         self.after(15, self.update_frame)
+
+
+# ---------------------- 记录页面 ----------------------
+class RecordPage(tk.Frame):
+    def __init__(self, parent, controller: MainApp):
+        super().__init__(parent, bg=COLOR_BG)
+        self.controller = controller
+
+        top_frame = tk.Frame(self, bg=COLOR_BG)
+        top_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        back_btn = tk.Button(
+            top_frame, text="← 返回主页",
+            command=lambda: controller.show_frame(HomePage),
+            font=("SimHei", 11), bg=COLOR_GRAY, fg="white", relief=tk.FLAT
+        )
+        back_btn.pack(side=tk.LEFT)
+
+        title_label = tk.Label(
+            top_frame, text="我的记录",
+            font=("SimHei", 18, "bold"), fg=COLOR_TEXT, bg=COLOR_BG
+        )
+        title_label.pack(side=tk.LEFT, padx=60)
+
+        clear_btn = tk.Button(
+            top_frame, text="清空全部记录", command=self.clear_all,
+            font=("SimHei", 11), bg="#dc2626", fg="white", relief=tk.FLAT
+        )
+        clear_btn.pack(side=tk.RIGHT)
+
+        # 表格
+        self.tree = ttk.Treeview(self, columns=("id", "time", "type", "result"), show="headings")
+        self.tree.heading("id", text="编号")
+        self.tree.heading("time", text="测试时间")
+        self.tree.heading("type", text="测试项目")
+        self.tree.heading("result", text="结果")
+        self.tree.column("id", width=60)
+        self.tree.column("time", width=180)
+        self.tree.column("type", width=160)
+        self.tree.column("result", width=120)
+        self.tree.grid(row=1, column=0, sticky="nsew", pady=10)
+
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+    def refresh(self):
+        """从后端拉取记录列表"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        res = self.controller.send_command(CMD_GET_RECORDS)
+        if not res.get("success"):
+            self.tree.insert("", tk.END, values=("-", "无法连接后端", "", ""))
+            return
+
+        records = res.get("records", [])
+        if not records:
+            self.tree.insert("", tk.END, values=("-", "暂无记录", "", ""))
+            return
+
+        for r in records:
+            rid, t, typ, cnt, sc = r
+            if cnt is not None:
+                result = f"{cnt} 次"
+            elif sc is not None:
+                result = f"{sc:.1f} 分"
+            else:
+                result = "--"
+            self.tree.insert("", tk.END, values=(rid, t, typ, result))
+
+    def clear_all(self):
+        if messagebox.askyesno("确认", "确定清空全部记录？"):
+            self.controller.send_command(CMD_CLEAR_RECORDS)
+            self.refresh()
+
 
 if __name__ == "__main__":
     app = MainApp()
