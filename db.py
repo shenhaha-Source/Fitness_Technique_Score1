@@ -53,9 +53,16 @@ def count_to_score(count: int, full_count: int) -> float:
 
 def get_db_path():
     """
-    获取数据库文件的绝对路径。
+    获取数据库文件的绝对路径，兼容开发环境和PyInstaller打包环境。
+    数据库生成在exe同级目录。
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    import sys
+    if hasattr(sys, '_MEIPASS'):
+        # 打包后：用exe所在目录
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        # 开发环境：用脚本所在目录
+        base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, "record.db")
 
 
@@ -132,20 +139,20 @@ def init_db():
 
 def _seed_test_users():
     """
-    预置演示测试账号。
+    预置演示测试账号（仅保留老师账号，学生不预置）。
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
+    cur.execute("SELECT COUNT(*) FROM users WHERE role='teacher'")
     count = cur.fetchone()[0]
     if count > 0:
         conn.close()
         return
 
-    add_user("stu01", "123456", "student", "张三", "2023001")
+    # 只预置老师账号，不预置学生
     add_user("tea01", "123456", "teacher", "李老师", "T001")
     conn.close()
-    print("✅ 已预置测试账号：stu01/123456（学生），tea01/123456（老师）")
+    print("✅ 已预置老师账号：tea01/123456")
 
 
 # ========== 用户：注册 / 登录 ==========

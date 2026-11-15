@@ -92,25 +92,38 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 def get_model_path(filename: str) -> str:
     """
     获取模型文件路径，兼容开发环境和 PyInstaller 打包环境。
+    模型文件放在exe同级目录，不打包进exe内部。
     """
     if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
+        # 打包后：用exe所在目录
+        base_path = os.path.dirname(sys.executable)
     else:
+        # 开发环境：用脚本所在目录
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, filename)
 
 
-pose_model_path = get_model_path("pose_landmarker_full.task")
-face_model_path = get_model_path("face_landmarker.task")
+def load_model_bytes(filename: str) -> bytes:
+    """
+    直接读取模型文件为字节流，绕过中文路径问题（mediapipe C扩展不支持中文路径）。
+    """
+    path = get_model_path(filename)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# 用字节流加载模型，避免中文路径导致FileNotFoundError
+pose_model_bytes = load_model_bytes("pose_landmarker_full.task")
+face_model_bytes = load_model_bytes("face_landmarker.task")
 
 pose_options = PoseLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=pose_model_path),
+    base_options=BaseOptions(model_asset_buffer=pose_model_bytes),
     running_mode=VisionRunningMode.IMAGE
 )
 pose_detector = PoseLandmarker.create_from_options(pose_options)
 
 face_options = FaceLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=face_model_path),
+    base_options=BaseOptions(model_asset_buffer=face_model_bytes),
     running_mode=VisionRunningMode.IMAGE,
     num_faces=1
 )

@@ -5,7 +5,7 @@ import numpy as np
 import tkinter as tk
 from tkinter import messagebox
 from PIL import Image, ImageTk
-import subprocess
+import threading
 import psutil
 import sys
 import os
@@ -15,6 +15,7 @@ from login_view import LoginView
 from student_view import StudentView
 from teacher_view import TeacherView
 from star_bg import StarBackground
+import server as backend_server
 
 HOST = "127.0.0.1"
 PORT = 8888
@@ -31,14 +32,6 @@ CMD_CLEAR_RECORDS = 0x84
 BG_COLOR = "#0B1020"
 
 
-def get_resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
-
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -47,13 +40,13 @@ class MainApp(tk.Tk):
         self.resizable(True, True)
         self.configure(bg=BG_COLOR)
 
-        self.server_proc = None
+        self.server_thread = None
         self.sock = None
         self.session_id = None
         self.user_info = None
         self.current_view = None
 
-        # 启动后端
+        # 启动后端（后台线程，同进程，不会反复弹窗）
         self.start_backend()
         self.after(800, self.connect_server)
 
@@ -70,14 +63,15 @@ class MainApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ========== 后端进程管理 ==========
+    # ========== 后端服务管理（同进程后台线程） ==========
     def start_backend(self):
-        server_py = get_resource_path("server.py")
-        exe_path = get_resource_path("server.exe")
-        if os.path.exists(exe_path):
-            self.server_proc = subprocess.Popen([exe_path], creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            self.server_proc = subprocess.Popen([sys.executable, server_py])
+        # 开一个守护线程跑socket server，不会反复启动gui
+        self.server_thread = threading.Thread(
+            target=backend_server.start_server,
+            daemon=True
+        )
+        self.server_thread.start()
+        print("✅ 后端服务已在后台线程启动")
 
     def connect_server(self):
         try:
@@ -258,14 +252,7 @@ class MainApp(tk.Tk):
 
     # ========== 关闭 ==========
     def on_close(self):
-        if self.server_proc is not None:
-            try:
-                proc = psutil.Process(self.server_proc.pid)
-                for child in proc.children(recursive=True):
-                    child.kill()
-                proc.kill()
-            except:
-                pass
+        # 后台线程是daemon=True，主窗口关闭自动结束
         self.destroy()
 
 
