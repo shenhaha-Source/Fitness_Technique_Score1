@@ -36,7 +36,7 @@ class LoginView(tk.Frame):
 
         # 标题
         tk.Label(
-            self.card, text="AI体测辅助系统",
+            self.card, text="体测评分系统",
             font=("微软雅黑", 20, "bold"), fg=PRIMARY, bg=CARD_BG
         ).pack(pady=(0, 5))
 

@@ -6,8 +6,14 @@
 表结构：
 - users: 用户表（学生/教师）
 - sessions: 会话表（登录状态保持）
-- student_best_score: 学生正式体测最优成绩表（深蹲/拍手/俯卧撑，每个学生一行，仅存最高分）
+- student_best_score: 学生正式体测最优成绩表（深蹲/引体向上/俯卧撑，每个学生一行，仅存最高分）
 - face_fun_record: 趣味颜值评分记录表（仅学生可见，不计入正式成绩）
+
+打分规则（百分制）：
+- 引体向上：15次 = 100分
+- 深蹲：30次 = 100分
+- 俯卧撑：25次 = 100分
+- 总分 = 三项平均分（百分制）
 
 作者：AI动作测评系统
 """
@@ -22,19 +28,32 @@ import os
 # ========== 全局配置 ==========
 SESSION_TIMEOUT = 3600  # 会话有效期：1小时（滑动过期）
 
-# 总分权重：深蹲40% + 拍手30% + 俯卧撑30%
-WEIGHT_SQUAT = 0.4
-WEIGHT_CLAP = 0.3
-WEIGHT_PUSHUP = 0.3
+# 打分标准：多少次满分
+PULL_UP_FULL = 15    # 引体向上15次满分
+SQUAT_FULL = 30      # 深蹲30次满分
+PUSHUP_FULL = 25     # 俯卧撑25次满分
+
+
+def count_to_score(count: int, full_count: int) -> float:
+    """
+    把次数转换为百分制分数。
+
+    Args:
+        count: 完成次数
+        full_count: 多少次满分
+
+    Returns:
+        float: 百分制分数（0-100）
+    """
+    if count <= 0:
+        return 0.0
+    score = count / full_count * 100
+    return round(min(score, 100.0), 1)
 
 
 def get_db_path():
     """
     获取数据库文件的绝对路径。
-    打包后（PyInstaller）和开发环境都能正确定位。
-
-    Returns:
-        str: 数据库文件完整路径
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, "record.db")
@@ -47,12 +66,6 @@ DB_PATH = get_db_path()
 def get_pwd_hash(raw_pwd: str) -> str:
     """
     对原始密码进行 SHA-256 哈希，不存储明文密码。
-
-    Args:
-        raw_pwd: 用户输入的原始密码
-
-    Returns:
-        str: 64位十六进制哈希字符串
     """
     return hashlib.sha256(raw_pwd.encode("utf-8")).hexdigest()
 
@@ -61,7 +74,6 @@ def get_pwd_hash(raw_pwd: str) -> str:
 def init_db():
     """
     初始化数据库，创建所有表（如果不存在）。
-    首次运行时自动创建表结构并预置测试账号。
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -93,14 +105,14 @@ def init_db():
     CREATE TABLE IF NOT EXISTS student_best_score (
         user_id INTEGER PRIMARY KEY,
         squat INTEGER DEFAULT 0,
-        clap INTEGER DEFAULT 0,
+        pull_up INTEGER DEFAULT 0,
         pushup INTEGER DEFAULT 0,
         last_update TEXT,
         FOREIGN KEY (user_id) REFERENCES users(id)
     )
     ''')
 
-    # 4. 趣味颜值评分记录表（和正式成绩完全隔离）
+    # 4. 趣味颜值评分记录表
     cur.execute('''
     CREATE TABLE IF NOT EXISTS face_fun_record (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,9 +132,7 @@ def init_db():
 
 def _seed_test_users():
     """
-    预置演示测试账号（仅数据库为空时执行）。
-    学生：stu01 / 123456（张三，2023001）
-    教师：tea01 / 123456（李老师，T001）
+    预置演示测试账号。
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -132,9 +142,7 @@ def _seed_test_users():
         conn.close()
         return
 
-    # 学生测试账号（add_user 会自动初始化成绩行）
     add_user("stu01", "123456", "student", "张三", "2023001")
-    # 老师测试账号
     add_user("tea01", "123456", "teacher", "李老师", "T001")
     conn.close()
     print("✅ 已预置测试账号：stu01/123456（学生），tea01/123456（老师）")
@@ -144,16 +152,6 @@ def _seed_test_users():
 def add_user(username: str, raw_pwd: str, role: str, name: str, student_id: str = "") -> bool:
     """
     注册新用户。学生注册时自动初始化一行全0的成绩记录。
-
-    Args:
-        username: 登录用户名（唯一）
-        raw_pwd: 原始密码
-        role: 角色，"student" 或 "teacher"
-        name: 真实姓名
-        student_id: 学号/工号
-
-    Returns:
-        bool: True=注册成功；False=用户名已存在
     """
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -165,11 +163,10 @@ def add_user(username: str, raw_pwd: str, role: str, name: str, student_id: str 
         )
         user_id = cur.lastrowid
 
-        # 学生自动初始化成绩行
         if role == "student":
             now = time.strftime("%Y-%m-%d %H:%M:%S")
             cur.execute(
-                "INSERT INTO student_best_score (user_id, squat, clap, pushup, last_update) VALUES (?,?,?,?,?)",
+                "INSERT INTO student_best_score (user_id, squat, pull_up, pushup, last_update) VALUES (?,?,?,?,?)",
                 (user_id, 0, 0, 0, now)
             )
 
@@ -177,20 +174,12 @@ def add_user(username: str, raw_pwd: str, role: str, name: str, student_id: str 
         conn.close()
         return True
     except sqlite3.IntegrityError:
-        # 用户名重复
         return False
 
 
 def login_user(username: str, raw_pwd: str):
     """
     校验用户名密码，登录成功返回用户信息。
-
-    Args:
-        username: 登录用户名
-        raw_pwd: 原始密码
-
-    Returns:
-        dict 或 None: 成功返回用户信息字典，失败返回 None
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -216,12 +205,6 @@ def login_user(username: str, raw_pwd: str):
 def create_session(user_id: int) -> str:
     """
     登录成功后创建会话，返回 session_id。
-
-    Args:
-        user_id: 用户ID
-
-    Returns:
-        str: 32位随机会话令牌
     """
     session_id = uuid.uuid4().hex
     expire_time = time.time() + SESSION_TIMEOUT
@@ -239,12 +222,6 @@ def create_session(user_id: int) -> str:
 def check_session(session_id: str):
     """
     校验会话是否有效，有效则自动续期（滑动过期）。
-
-    Args:
-        session_id: 会话令牌
-
-    Returns:
-        dict 或 None: 有效返回用户信息，无效/过期返回 None
     """
     now = time.time()
     conn = sqlite3.connect(DB_PATH)
@@ -264,13 +241,11 @@ def check_session(session_id: str):
 
     expire_time = row[5]
     if expire_time < now:
-        # 过期，删除这条会话
         cur.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
         conn.close()
         return None
 
-    # 滑动续期：刷新过期时间
     new_expire = now + SESSION_TIMEOUT
     cur.execute("UPDATE sessions SET expire_time=? WHERE session_id=?", (new_expire, session_id))
     conn.commit()
@@ -286,54 +261,63 @@ def check_session(session_id: str):
 
 
 # ========== 正式体测成绩 ==========
-def calc_total(squat: int, clap: int, pushup: int) -> float:
+def calc_total(squat: int, pull_up: int, pushup: int) -> float:
     """
-    计算综合总分：深蹲40% + 拍手30% + 俯卧撑30%。
+    计算综合总分（百分制）：三项平均分。
 
     Args:
         squat: 深蹲最优次数
-        clap: 拍手最优次数
+        pull_up: 引体向上最优次数
         pushup: 俯卧撑最优次数
 
     Returns:
-        float: 加权总分（保留1位小数）
+        float: 百分制总分（0-100）
     """
-    total = squat * WEIGHT_SQUAT + clap * WEIGHT_CLAP + pushup * WEIGHT_PUSHUP
+    s_score = count_to_score(squat, SQUAT_FULL)
+    pu_score = count_to_score(pull_up, PULL_UP_FULL)
+    p_score = count_to_score(pushup, PUSHUP_FULL)
+    total = (s_score + pu_score + p_score) / 3
     return round(total, 1)
 
 
 def get_student_best(uid: int) -> dict:
     """
-    查询单个学生的三项最优成绩。
-
-    Args:
-        uid: 用户ID
+    查询单个学生的三项最优成绩和分数。
 
     Returns:
-        dict: {squat, clap, pushup, total, last_update}
+        dict: {squat, pull_up, pushup, squat_score, pull_up_score, pushup_score, total, last_update}
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT squat, clap, pushup, last_update FROM student_best_score WHERE user_id=?",
+        "SELECT squat, pull_up, pushup, last_update FROM student_best_score WHERE user_id=?",
         (uid,)
     )
     row = cur.fetchone()
     conn.close()
 
     if row:
-        squat, clap, pushup, last_update = row
-        total = calc_total(squat, clap, pushup)
+        squat, pull_up, pushup, last_update = row
+        squat_score = count_to_score(squat, SQUAT_FULL)
+        pull_up_score = count_to_score(pull_up, PULL_UP_FULL)
+        pushup_score = count_to_score(pushup, PUSHUP_FULL)
+        total = calc_total(squat, pull_up, pushup)
         return {
             "squat": squat,
-            "clap": clap,
+            "pull_up": pull_up,
             "pushup": pushup,
+            "squat_score": squat_score,
+            "pull_up_score": pull_up_score,
+            "pushup_score": pushup_score,
             "total": total,
             "last_update": last_update or ""
         }
     else:
-        # 没有成绩行，返回全0
-        return {"squat": 0, "clap": 0, "pushup": 0, "total": 0.0, "last_update": ""}
+        return {
+            "squat": 0, "pull_up": 0, "pushup": 0,
+            "squat_score": 0.0, "pull_up_score": 0.0, "pushup_score": 0.0,
+            "total": 0.0, "last_update": ""
+        }
 
 
 def update_best_score(uid: int, mode: str, new_val: int) -> bool:
@@ -342,25 +326,23 @@ def update_best_score(uid: int, mode: str, new_val: int) -> bool:
 
     Args:
         uid: 用户ID
-        mode: 项目标识，可选 "squat", "clap", "pushup"
+        mode: 项目标识，可选 "squat", "pull_up", "pushup"
         new_val: 本次测试得到的计数值
 
     Returns:
         bool: True=成绩已更新；False=新成绩不高于历史最高分，未改动
     """
-    valid_modes = ("squat", "clap", "pushup")
+    valid_modes = ("squat", "pull_up", "pushup")
     if mode not in valid_modes:
         return False
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # 先查当前成绩
     cur.execute(f"SELECT {mode} FROM student_best_score WHERE user_id=?", (uid,))
     row = cur.fetchone()
 
     if not row:
-        # 没有成绩行，插入一条
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         cur.execute(
             f"INSERT INTO student_best_score (user_id, {mode}, last_update) VALUES (?,?,?)",
@@ -388,17 +370,16 @@ def update_best_score(uid: int, mode: str, new_val: int) -> bool:
 def get_all_student_score_for_teacher() -> list:
     """
     教师端查询所有注册学生的正式体测成绩。
-    所有注册学生都会出现，未测试项目为0。
 
     Returns:
-        list: 每行 [name, student_id, squat, clap, pushup, total]
+        list: 每行 [name, student_id, squat, squat_score, pull_up, pull_up_score, pushup, pushup_score, total]
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('''
         SELECT u.name, u.student_id, 
                COALESCE(s.squat, 0), 
-               COALESCE(s.clap, 0), 
+               COALESCE(s.pull_up, 0), 
                COALESCE(s.pushup, 0),
                s.last_update
         FROM users u
@@ -411,20 +392,49 @@ def get_all_student_score_for_teacher() -> list:
 
     result = []
     for row in rows:
-        name, sid, squat, clap, pushup, last_update = row
-        total = calc_total(squat, clap, pushup)
-        result.append([name, sid, squat, clap, pushup, total])
+        name, sid, squat, pull_up, pushup, last_update = row
+        squat_score = count_to_score(squat, SQUAT_FULL)
+        pull_up_score = count_to_score(pull_up, PULL_UP_FULL)
+        pushup_score = count_to_score(pushup, PUSHUP_FULL)
+        total = calc_total(squat, pull_up, pushup)
+        result.append([name, sid, squat, squat_score, pull_up, pull_up_score, pushup, pushup_score, total])
     return result
 
 
-# ========== 趣味颜值记录（和正式成绩隔离） ==========
-def add_face_record(uid: int, score: float):
+def delete_student_score(name: str) -> bool:
     """
-    保存一条趣味颜值评分记录（仅学生可见，不计入正式成绩）。
+    老师端删除指定学生的成绩（把三项成绩清零）。
 
     Args:
-        uid: 用户ID
-        score: 颜值分数（0-100）
+        name: 学生姓名
+
+    Returns:
+        bool: True=删除成功；False=没找到
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # 先找到用户ID
+    cur.execute("SELECT id FROM users WHERE name=? AND role='student'", (name,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+    uid = row[0]
+    # 把成绩清零
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        "UPDATE student_best_score SET squat=0, pull_up=0, pushup=0, last_update=? WHERE user_id=?",
+        (now, uid)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+# ========== 趣味颜值记录 ==========
+def add_face_record(uid: int, score: float):
+    """
+    保存一条趣味颜值评分记录。
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -441,4 +451,4 @@ def add_face_record(uid: int, score: float):
 if __name__ == "__main__":
     init_db()
     print("✅ 数据库初始化完成")
-    print("测试账号：stu01/123456（学生），tea01/123456（老师）")
+    print("打分标准：引体向上15次满分，深蹲30次满分，俯卧撑25次满分")

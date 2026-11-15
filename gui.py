@@ -42,7 +42,7 @@ def get_resource_path(relative_path):
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AI动作测评系统")
+        self.title("体测评分系统")
         self.geometry("720x600")
         self.resizable(True, True)
         self.configure(bg=BG_COLOR)
@@ -237,14 +237,21 @@ class MainApp(tk.Tk):
             print(f"图像发送异常: {e}")
             return None
 
-    def _recv_json(self):
-        """接收一行JSON"""
+    def _recv_json(self, timeout=5.0):
+        """接收一行JSON，带超时"""
+        self.sock.settimeout(timeout)
         raw = b""
-        while True:
-            c = self.sock.recv(1)
-            if c == b"\n" or not c:
-                break
-            raw += c
+        try:
+            while True:
+                c = self.sock.recv(1)
+                if c == b"\n" or not c:
+                    break
+                raw += c
+        except socket.timeout:
+            print("⚠️ 接收响应超时")
+            return None
+        finally:
+            self.sock.settimeout(None)
         if raw:
             return json.loads(raw.decode("utf-8"))
         return None

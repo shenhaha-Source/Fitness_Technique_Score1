@@ -1,12 +1,13 @@
 """
 学生端视图模块（深色星空科技风）
 ================================
-包含学生所有页面：主页、拍手测试、深蹲测试、俯卧撑测试、颜值趣味测评、我的成绩。
+包含学生所有页面：主页、引体向上测试、深蹲测试、俯卧撑测试、颜值趣味测评、我的成绩。
 
-布局特点：
-- 深色星空背景（由全局 gui.py 提供）
-- 纵向通栏长条按钮竖向排列，宽度跟随窗口自适应
-- 成绩分行纵向展示
+打分规则：
+- 引体向上：15次满分（100分）
+- 深蹲：30次满分（100分）
+- 俯卧撑：25次满分（100分）
+- 总分 = 三项平均分
 """
 
 import cv2
@@ -20,7 +21,7 @@ CMD_STOP_TEST = 0x82
 CMD_GET_MY_SCORE = 0x85
 
 # 测试类型
-TEST_CLAP = 0
+TEST_PULL_UP = 0    # 引体向上（替换原来的拍手）
 TEST_SQUAT = 1
 TEST_FACE = 2
 TEST_PUSHUP = 3
@@ -42,13 +43,6 @@ SIDE_PAD = 30  # 左右边距
 class StudentView(tk.Frame):
     """
     学生端主视图容器，管理所有子页面切换。
-
-    Args:
-        parent: 父容器
-        send_command: 发送业务命令的回调函数
-        send_image_frame: 发送图像帧的回调函数
-        user_info: 当前登录用户信息
-        on_logout: 退出登录回调
     """
 
     def __init__(self, parent, send_command, send_image_frame, user_info, on_logout):
@@ -69,7 +63,7 @@ class StudentView(tk.Frame):
         # 注册所有子页面
         self.pages = {}
         page_classes = [
-            HomePage, ClapTestPage, SquatTestPage,
+            HomePage, PullUpTestPage, SquatTestPage,
             PushupTestPage, FaceScorePage, MyScorePage
         ]
         for Page in page_classes:
@@ -116,15 +110,15 @@ class HomePage(tk.Frame):
 
         # 标题
         tk.Label(
-            self, text="AI动作测评",
+            self, text="体测评分",
             font=("微软雅黑", 24, "bold"), fg=PRIMARY, bg=BG_COLOR
         ).pack(pady=(10, 15))
 
         # 测评按钮组（纵向通栏长条，宽度自适应）
         btn_info = [
+            ("💪 引体向上计数", lambda: sv.show_page(PullUpTestPage), PRIMARY),
             ("🏃 深蹲计数", lambda: sv.show_page(SquatTestPage), PRIMARY),
-            ("👏 拍手计数", lambda: sv.show_page(ClapTestPage), PRIMARY),
-            ("💪 俯卧撑计数", lambda: sv.show_page(PushupTestPage), PRIMARY),
+            ("🤸 俯卧撑计数", lambda: sv.show_page(PushupTestPage), PRIMARY),
             ("✨ 颜值趣味测评", lambda: sv.show_page(FaceScorePage), ACCENT),
             ("📊 我的成绩", lambda: sv.show_page(MyScorePage), SUCCESS),
         ]
@@ -154,6 +148,7 @@ class BaseTestPage(tk.Frame):
         self.is_running = False
         self.cap = None
         self.imgtk = None
+        self.auto_stopped = False  # 是否自动停止（引体向上掉落）
 
         # 顶部导航
         top = tk.Frame(self, bg=CARD_BG, height=50)
@@ -213,6 +208,7 @@ class BaseTestPage(tk.Frame):
         """开始测试"""
         if self.is_running:
             return
+        self.auto_stopped = False
         res = self.sv.send_command(CMD_START_TEST, extra=bytes([self.test_type]))
         if not res.get("ok"):
             messagebox.showerror("错误", res.get("msg", "启动失败"))
@@ -258,6 +254,15 @@ class BaseTestPage(tk.Frame):
             self.stop()
             return
 
+        # 检查是否自动停止（引体向上掉落）
+        if res.get("auto_stop") and not self.auto_stopped:
+            self.auto_stopped = True
+            count = res.get("count", 0)
+            score = res.get("score") or 0
+            messagebox.showinfo("测试结束", f"已掉落，测试结束！\n完成次数：{count}\n得分：{score:.0f}分")
+            self.stop()
+            return
+
         self.on_frame_result(res, frame)
 
         # 等比例缩放显示，不拉伸变形
@@ -269,11 +274,9 @@ class BaseTestPage(tk.Frame):
             img_ratio = img.width / img.height
             label_ratio = w / h
             if img_ratio > label_ratio:
-                # 图片更宽，按宽度适配
                 new_w = w
                 new_h = int(w / img_ratio)
             else:
-                # 图片更高，按高度适配
                 new_h = h
                 new_w = int(h * img_ratio)
             img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
@@ -285,21 +288,21 @@ class BaseTestPage(tk.Frame):
         """子类可重写：处理后端返回的帧结果"""
         pass
 
-
-# ---------------------- 拍手测试 ----------------------
-class ClapTestPage(BaseTestPage):
-    """拍手计数测试页"""
+# ---------------------- 引体向上测试 ----------------------
+class PullUpTestPage(BaseTestPage):
+    """引体向上计数测试页（掉落自动停止）"""
 
     def __init__(self, parent, sv: StudentView):
-        super().__init__(parent, sv, "👏 拍手计数测试", PRIMARY, TEST_CLAP, image_mode=0)
+        super().__init__(parent, sv, "💪 引体向上计数测试", PRIMARY, TEST_PULL_UP, image_mode=0)
 
     def on_start(self):
-        self.info.config(text="拍手总数：0")
+        self.info.config(text="引体向上：0个 | 得分：0分")
 
     def on_frame_result(self, res: dict, frame):
         tip = res.get("tip", "")
         count = res.get("count", 0)
-        self.info.config(text=f"拍手总数：{count}")
+        score = res.get("score") or 0
+        self.info.config(text=f"引体向上：{count}个 | 得分：{score:.0f}分")
         cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
 
@@ -311,12 +314,13 @@ class SquatTestPage(BaseTestPage):
         super().__init__(parent, sv, "🏃 深蹲计数测试", PRIMARY, TEST_SQUAT, image_mode=0)
 
     def on_start(self):
-        self.info.config(text="深蹲总数：0")
+        self.info.config(text="深蹲：0个 | 得分：0分")
 
     def on_frame_result(self, res: dict, frame):
         tip = res.get("tip", "")
         count = res.get("count", 0)
-        self.info.config(text=f"深蹲总数：{count}")
+        score = res.get("score") or 0
+        self.info.config(text=f"深蹲：{count}个 | 得分：{score:.0f}分")
         cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
 
@@ -325,15 +329,16 @@ class PushupTestPage(BaseTestPage):
     """俯卧撑计数测试页"""
 
     def __init__(self, parent, sv: StudentView):
-        super().__init__(parent, sv, "💪 俯卧撑计数测试", PRIMARY, TEST_PUSHUP, image_mode=0)
+        super().__init__(parent, sv, "🤸 俯卧撑计数测试", PRIMARY, TEST_PUSHUP, image_mode=0)
 
     def on_start(self):
-        self.info.config(text="俯卧撑总数：0")
+        self.info.config(text="俯卧撑：0个 | 得分：0分")
 
     def on_frame_result(self, res: dict, frame):
         tip = res.get("tip", "")
         count = res.get("count", 0)
-        self.info.config(text=f"俯卧撑总数：{count}")
+        score = res.get("score") or 0
+        self.info.config(text=f"俯卧撑：{count}个 | 得分：{score:.0f}分")
         cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
 
@@ -408,19 +413,22 @@ class MyScorePage(tk.Frame):
             return
 
         score = res.get("score", {})
+        pull_up = score.get("pull_up", 0)
         squat = score.get("squat", 0)
-        clap = score.get("clap", 0)
         pushup = score.get("pushup", 0)
+        pull_up_score = score.get("pull_up_score", 0)
+        squat_score = score.get("squat_score", 0)
+        pushup_score = score.get("pushup_score", 0)
         total = score.get("total", 0)
 
-        # 评价
-        if total >= 15:
+        # 评价（百分制）
+        if total >= 90:
             eval_text = "优秀"
             eval_color = SUCCESS
-        elif total >= 10:
+        elif total >= 75:
             eval_text = "良好"
             eval_color = PRIMARY
-        elif total >= 6:
+        elif total >= 60:
             eval_text = "及格"
             eval_color = "#FBBF24"
         else:
@@ -429,10 +437,10 @@ class MyScorePage(tk.Frame):
 
         # 纵向分行展示
         rows = [
-            ("深蹲最优次数", f"{squat} 次", PRIMARY),
-            ("拍手最优次数", f"{clap} 次", PRIMARY),
-            ("俯卧撑最优次数", f"{pushup} 次", PRIMARY),
-            ("综合总分", f"{total}", SUCCESS),
+            ("引体向上", f"{pull_up} 次 | {pull_up_score:.0f} 分", PRIMARY),
+            ("深蹲", f"{squat} 次 | {squat_score:.0f} 分", PRIMARY),
+            ("俯卧撑", f"{pushup} 次 | {pushup_score:.0f} 分", PRIMARY),
+            ("综合总分", f"{total:.1f} 分", SUCCESS),
             ("综合评价", eval_text, eval_color),
         ]
 

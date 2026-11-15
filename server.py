@@ -4,10 +4,16 @@
 基于 MediaPipe 的姿态/人脸检测服务，处理 Socket 通信、业务逻辑、成绩管理。
 
 功能：
-- 姿态识别：拍手计数、深蹲计数、俯卧撑计数
+- 姿态识别：引体向上计数（掉落自动停止）、深蹲计数、俯卧撑计数
 - 人脸识别：颜值比例趣味评分
 - 用户认证：登录、注册、Session 会话管理
-- 成绩管理：正式项目最高分保留、教师端成绩查询
+- 成绩管理：正式项目最高分保留、百分制打分、教师端成绩查询
+
+打分规则：
+- 引体向上：15次 = 100分
+- 深蹲：30次 = 100分
+- 俯卧撑：25次 = 100分
+- 总分 = 三项平均分
 
 通信协议：
 - 认证帧：命令码(1) + JSON长度(4) + JSON数据
@@ -27,18 +33,25 @@ import sys
 from db import (
     init_db, add_user, login_user, create_session, check_session,
     update_best_score, get_student_best, get_all_student_score_for_teacher,
-    add_face_record
+    add_face_record, count_to_score, delete_student_score,
+    PULL_UP_FULL, SQUAT_FULL, PUSHUP_FULL
 )
 
 HOST = "127.0.0.1"
 PORT = 8888
 
 # ========== 业务参数阈值 ==========
-# 拍手
-HAND_CLOSE_THRESH = 0.35   # 双手距离小于此值 = 合拢
-HAND_OPEN_THRESH = 0.45    # 双手距离大于此值 = 张开
-STATE_APART = "apart"
-STATE_CLAP = "clap"
+# 引体向上
+PULL_UP_UP_Y_THRESH = 0.03   # 鼻子比肩线高多少算拉起到位
+PULL_UP_DOWN_Y_THRESH = 0.02 # 鼻子比肩线低多少算下放到位
+PULL_UP_GRIP_RATIO = 0.02    # 手腕比肩膀高多少算抓杆
+PULL_UP_STRAIGHT_ANGLE = 130.0 # 手肘角度大于此值 = 手臂伸直（放宽到130°）
+PU_DEBOUNCE_FRAMES = 2        # 连续多少帧满足条件才切换状态（放宽到2帧）
+PU_FALL_FRAMES = 5            # 连续多少帧检测不到抓杆 = 掉落
+PU_GRIP_CONFIRM_FRAMES = 20   # 连续多少帧保持抓杆才算真的跳上去了
+STATE_PU_WAIT = "wait"        # 等待抓杆（初始状态，人在地面）
+STATE_PU_READY = "ready"      # 抓杆、手臂伸直（基准状态）
+STATE_PU_UP = "up"            # 拉起，下巴过杆
 
 # 深蹲
 SQUAT_THRESHOLD = 0.08     # 髋膝y坐标差阈值
@@ -52,7 +65,7 @@ STATE_UP = "up"
 STATE_DOWN = "down"
 
 # 测试类型枚举
-TEST_CLAP = 0
+TEST_PULL_UP = 0      # 引体向上（替换原来的拍手）
 TEST_SQUAT = 1
 TEST_FACE = 2
 TEST_PUSHUP = 3
@@ -65,6 +78,7 @@ CMD_STOP_TEST = 0x82
 CMD_GET_MY_SCORE = 0x85      # 学生查我的成绩
 CMD_GET_ALL_SCORES = 0x86    # 老师查全部成绩
 CMD_CLEAR_RECORDS = 0x84
+CMD_DELETE_STUDENT = 0x87    # 老师删除学生成绩
 
 # MediaPipe 组件初始化
 BaseOptions = mp.tasks.BaseOptions
@@ -78,12 +92,6 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 def get_model_path(filename: str) -> str:
     """
     获取模型文件路径，兼容开发环境和 PyInstaller 打包环境。
-
-    Args:
-        filename: 模型文件名
-
-    Returns:
-        str: 模型文件完整路径
     """
     if hasattr(sys, '_MEIPASS'):
         base_path = sys._MEIPASS
@@ -118,14 +126,6 @@ print("✅ Pose + FaceLandmarker 模型加载完成")
 def calc_angle(a: dict, b: dict, c: dict) -> float:
     """
     计算三点角度：以 b 为顶点，a-b-c 的夹角（度）。
-
-    Args:
-        a: 点A坐标 {"x":.., "y":..}
-        b: 顶点B坐标
-        c: 点C坐标
-
-    Returns:
-        float: 角度值（0-180度）
     """
     a = np.array([a["x"], a["y"]])
     b = np.array([b["x"], b["y"]])
@@ -140,12 +140,6 @@ def calc_angle(a: dict, b: dict, c: dict) -> float:
 def calc_face_score(lm: list) -> float:
     """
     计算颜值比例趣味评分（基于面部关键点几何比例）。
-
-    Args:
-        lm: 人脸关键点列表
-
-    Returns:
-        float: 0-100分，关键点不足返回 None
     """
     if len(lm) < 300:
         return None
@@ -157,13 +151,11 @@ def calc_face_score(lm: list) -> float:
     rmouth = lm[61]
     lmouth = lm[291]
 
-    # 三庭比例
     h1 = abs(nose["y"] - forehead["y"])
     h2 = abs(chin["y"] - nose["y"])
     ratio_three = h1 / h2 if h2 > 1e-6 else 1
     score_three = max(0, 100 - abs(ratio_three - 1) * 60)
 
-    # 五官对称度
     eye_sym = abs(reye["y"] - leye["y"])
     mouth_sym = abs(rmouth["y"] - lmouth["y"])
     sym_score = max(0, 100 - (eye_sym + mouth_sym) * 250)
@@ -176,16 +168,22 @@ def calc_face_score(lm: list) -> float:
 class SessionState:
     """
     每个客户端连接独立的会话状态。
-    记录当前登录用户、当前测试类型、各测试的计数状态。
     """
 
     def __init__(self):
         self.user = None            # 登录用户信息
         self.current_test = None    # 当前测试类型
 
-        # 拍手状态
-        self.clap_state = STATE_APART
-        self.clap_count = 0
+        # 引体向上状态
+        self.pu_state = STATE_PU_WAIT   # 初始状态：等待抓杆（人在地面）
+        self.pu_count = 0
+        self.pu_fall_counter = 0    # 掉落检测计数器
+        self.pu_stopped = False     # 是否已因掉落停止
+        self.pu_grip_started = False # 是否已成功抓杆（经过确认）
+        self.pu_grip_confirm = 0    # 抓杆确认计数器（连续多少帧保持抓杆）
+        self.pu_debounce = 0        # 防抖计数器
+        self.pu_tip_timer = 0       # 提示显示计时器（持续多少帧）
+        self.pu_tip_text = ""       # 要显示的提示文字
 
         # 深蹲状态
         self.squat_state = STATE_STAND
@@ -201,13 +199,17 @@ class SessionState:
     def reset_test(self, test_type: int):
         """
         开始新测试，重置所有计数状态。
-
-        Args:
-            test_type: 测试类型枚举
         """
         self.current_test = test_type
-        self.clap_state = STATE_APART
-        self.clap_count = 0
+        self.pu_state = STATE_PU_WAIT
+        self.pu_count = 0
+        self.pu_fall_counter = 0
+        self.pu_stopped = False
+        self.pu_grip_started = False
+        self.pu_grip_confirm = 0
+        self.pu_debounce = 0
+        self.pu_tip_timer = 0
+        self.pu_tip_text = ""
         self.squat_state = STATE_STAND
         self.squat_count = 0
         self.pushup_state = STATE_UP
@@ -217,17 +219,17 @@ class SessionState:
     def stop_test(self):
         """
         结束当前测试，返回 (测试名称, 计数, 分数)。
-
-        Returns:
-            tuple 或 None: (test_name, count, score)
         """
         result = None
-        if self.current_test == TEST_CLAP:
-            result = ("拍手计数测试", self.clap_count, None)
+        if self.current_test == TEST_PULL_UP:
+            score = count_to_score(self.pu_count, PULL_UP_FULL)
+            result = ("引体向上计数测试", self.pu_count, score)
         elif self.current_test == TEST_SQUAT:
-            result = ("深蹲计数测试", self.squat_count, None)
+            score = count_to_score(self.squat_count, SQUAT_FULL)
+            result = ("深蹲计数测试", self.squat_count, score)
         elif self.current_test == TEST_PUSHUP:
-            result = ("俯卧撑计数测试", self.pushup_count, None)
+            score = count_to_score(self.pushup_count, PUSHUP_FULL)
+            result = ("俯卧撑计数测试", self.pushup_count, score)
         elif self.current_test == TEST_FACE:
             if self.last_face_score is not None:
                 result = ("颜值比例测评", None, round(self.last_face_score, 1))
@@ -239,13 +241,6 @@ class SessionState:
 def recv_exact(conn, n: int) -> bytes:
     """
     精确读取 n 个字节，防止粘包。
-
-    Args:
-        conn: socket 连接
-        n: 要读取的字节数
-
-    Returns:
-        bytes 或 None: 读取到的数据，连接断开返回 None
     """
     data = b""
     while len(data) < n:
@@ -259,10 +254,6 @@ def recv_exact(conn, n: int) -> bytes:
 def send_json(conn, obj: dict):
     """
     发送 JSON 响应（以换行符结尾）。
-
-    Args:
-        conn: socket 连接
-        obj: 要发送的字典对象
     """
     send_buf = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
     conn.sendall(send_buf)
@@ -271,12 +262,6 @@ def send_json(conn, obj: dict):
 def recv_json(conn) -> dict:
     """
     接收一行 JSON 响应。
-
-    Args:
-        conn: socket 连接
-
-    Returns:
-        dict: 解析后的 JSON 对象，失败返回空字典
     """
     raw = b""
     while True:
@@ -292,12 +277,6 @@ def recv_json(conn) -> dict:
 def recv_session_id(conn) -> str:
     """
     读取 session_id（1字节长度 + N字节内容）。
-
-    Args:
-        conn: socket 连接
-
-    Returns:
-        str 或 None: session 字符串
     """
     len_data = recv_exact(conn, 1)
     if len_data is None:
@@ -313,10 +292,6 @@ def recv_session_id(conn) -> str:
 def handle_client(conn, addr):
     """
     处理单个客户端连接的主循环。
-
-    Args:
-        conn: socket 连接对象
-        addr: 客户端地址
     """
     print(f"👉 客户端连接 {addr}")
     session = SessionState()
@@ -328,7 +303,7 @@ def handle_client(conn, addr):
                 break
             first = first_byte[0]
 
-            # ========== 认证类命令（不需要 session） ==========
+            # ========== 认证类命令 ==========
             if first == CMD_REGISTER:
                 _handle_register(conn)
                 continue
@@ -337,12 +312,12 @@ def handle_client(conn, addr):
                 _handle_login(conn, session)
                 continue
 
-            # ========== 图像帧（模式 0=pose, 1=face，不需要 session） ==========
+            # ========== 图像帧 ==========
             if first in (0, 1):
                 _handle_image_frame(conn, session, first)
                 continue
 
-            # ========== 业务类命令（需要 session 校验） ==========
+            # ========== 业务类命令 ==========
             sid = recv_session_id(conn)
             if sid is None:
                 break
@@ -353,7 +328,13 @@ def handle_client(conn, addr):
                 continue
 
             session.user = user
-            _handle_business_command(conn, session, first)
+            try:
+                _handle_business_command(conn, session, first)
+            except Exception as e:
+                print(f"业务命令处理异常: {e}")
+                import traceback
+                traceback.print_exc()
+                send_json(conn, {"ok": False, "msg": f"服务器内部错误: {e}"})
 
         except Exception as e:
             print(f"处理异常：{e}")
@@ -418,11 +399,6 @@ def _handle_login(conn, session: SessionState):
 def _handle_business_command(conn, session: SessionState, cmd: int):
     """
     处理业务类命令（已通过 session 校验）。
-
-    Args:
-        conn: socket 连接
-        session: 会话状态
-        cmd: 命令码
     """
     user = session.user
 
@@ -441,8 +417,8 @@ def _handle_business_command(conn, session: SessionState, cmd: int):
             # 正式项目：写入最高分成绩表
             if test_name == "深蹲计数测试":
                 update_best_score(user["uid"], "squat", count)
-            elif test_name == "拍手计数测试":
-                update_best_score(user["uid"], "clap", count)
+            elif test_name == "引体向上计数测试":
+                update_best_score(user["uid"], "pull_up", count)
             elif test_name == "俯卧撑计数测试":
                 update_best_score(user["uid"], "pushup", count)
             # 趣味项目：单独存颜值记录表
@@ -452,17 +428,36 @@ def _handle_business_command(conn, session: SessionState, cmd: int):
         send_json(conn, {"ok": True, "msg": "测试已结束"})
 
     elif cmd == CMD_GET_MY_SCORE:
-        # 学生查自己的成绩
         best = get_student_best(user["uid"])
         send_json(conn, {"ok": True, "score": best})
 
     elif cmd == CMD_GET_ALL_SCORES:
-        # 老师查全部学生成绩
         if user["role"] != "teacher":
             send_json(conn, {"ok": False, "msg": "无权限"})
             return
         scores = get_all_student_score_for_teacher()
         send_json(conn, {"ok": True, "scores": scores})
+
+    elif cmd == CMD_DELETE_STUDENT:
+        # 老师删除指定学生成绩
+        if user["role"] != "teacher":
+            send_json(conn, {"ok": False, "msg": "无权限"})
+            return
+        # 读取要删除的学生姓名
+        name_len_data = recv_exact(conn, 1)
+        if name_len_data is None:
+            return
+        name_len = name_len_data[0]
+        name_data = recv_exact(conn, name_len)
+        if name_data is None:
+            return
+        student_name = name_data.decode("utf-8")
+        ok = delete_student_score(student_name)
+        if ok:
+            send_json(conn, {"ok": True, "msg": f"已删除 {student_name} 的成绩"})
+            print(f"🗑️ 老师删除了 {student_name} 的成绩")
+        else:
+            send_json(conn, {"ok": False, "msg": "未找到该学生"})
 
     elif cmd == CMD_CLEAR_RECORDS:
         send_json(conn, {"ok": True, "msg": "已清空"})
@@ -474,11 +469,6 @@ def _handle_business_command(conn, session: SessionState, cmd: int):
 def _handle_image_frame(conn, session: SessionState, mode: int):
     """
     处理图像帧：姿态识别/人脸识别 + 计数。
-
-    Args:
-        conn: socket 连接
-        session: 会话状态
-        mode: 0=pose姿态, 1=face人脸
     """
     len_buf = recv_exact(conn, 4)
     if len_buf is None:
@@ -498,7 +488,7 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    response = {"success": False, "tip": "未检测到", "count": 0, "score": None}
+    response = {"success": False, "tip": "未检测到", "count": 0, "score": None, "auto_stop": False}
 
     if mode == 0:
         # ===== 姿态识别 =====
@@ -508,22 +498,112 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
             lm_list = [{"x": p.x, "y": p.y, "z": p.z} for p in lm]
             response["success"] = True
 
-            # 拍手计数
-            if session.current_test == TEST_CLAP and len(lm_list) >= 17:
-                rw = lm_list[15]
-                lw = lm_list[16]
-                dist = np.sqrt((rw["x"] - lw["x"]) ** 2 + (rw["y"] - lw["y"]) ** 2)
-                response["tip"] = f"距离:{dist:.3f}"
+            # 引体向上计数
+            if session.current_test == TEST_PULL_UP and len(lm_list) >= 17:
+                # 如果已经因掉落停止，直接返回
+                if session.pu_stopped:
+                    current_score = count_to_score(session.pu_count, PULL_UP_FULL)
+                    response["count"] = session.pu_count
+                    response["score"] = current_score
+                    response["tip"] = "⚠️ 已掉落，测试结束"
+                    response["auto_stop"] = True
+                    send_json(conn, response)
+                    return
 
-                if session.clap_state == STATE_APART:
-                    if dist < HAND_CLOSE_THRESH:
-                        session.clap_state = STATE_CLAP
-                elif session.clap_state == STATE_CLAP:
-                    if dist > HAND_OPEN_THRESH:
-                        session.clap_count += 1
-                        response["tip"] = "👏拍手成功！"
-                        session.clap_state = STATE_APART
-                response["count"] = session.clap_count
+                nose = lm_list[0]
+                l_shoulder = lm_list[11]
+                r_shoulder = lm_list[12]
+                l_elbow = lm_list[13]
+                r_elbow = lm_list[14]
+                l_wrist = lm_list[15]
+                r_wrist = lm_list[16]
+
+                shoulder_y = (l_shoulder["y"] + r_shoulder["y"]) / 2
+                wrist_y = (l_wrist["y"] + r_wrist["y"]) / 2
+
+                # 计算左右手肘角度，判断手臂是否伸直
+                l_arm_angle = calc_angle(l_shoulder, l_elbow, l_wrist)
+                r_arm_angle = calc_angle(r_shoulder, r_elbow, r_wrist)
+                arm_straight = (l_arm_angle > PULL_UP_STRAIGHT_ANGLE and
+                                r_arm_angle > PULL_UP_STRAIGHT_ANGLE)
+
+                # 判断是否抓杆：手腕高于肩膀
+                is_grip = wrist_y < shoulder_y - PULL_UP_GRIP_RATIO
+
+                # 掉落检测：只有已经开始抓杆之后，才检测掉落
+                if session.pu_grip_started:
+                    if not is_grip:
+                        session.pu_fall_counter += 1
+                        if session.pu_fall_counter >= PU_FALL_FRAMES:
+                            session.pu_stopped = True
+                            current_score = count_to_score(session.pu_count, PULL_UP_FULL)
+                            response["count"] = session.pu_count
+                            response["score"] = current_score
+                            response["tip"] = "⚠️ 已掉落，测试结束！"
+                            response["auto_stop"] = True
+                            send_json(conn, response)
+                            return
+                    else:
+                        session.pu_fall_counter = 0
+                else:
+                    # 还没成功抓杆，开始确认过程
+                    if is_grip and arm_straight:
+                        # 连续保持抓杆+手臂伸直，确认真的抓杆了
+                        session.pu_grip_confirm += 1
+                        if session.pu_grip_confirm >= PU_GRIP_CONFIRM_FRAMES:  # 连续多帧才算真抓杆
+                            session.pu_grip_started = True
+                            session.pu_state = STATE_PU_READY
+                            session.pu_debounce = 0
+                            # 设置提示，持续显示2秒（约60帧）
+                            session.pu_tip_timer = 60
+                            session.pu_tip_text = "✅ 抓杆成功！开始做引体向上！"
+                    else:
+                        # 不满足抓杆条件，重置确认计数（随便抬手一下不算数）
+                        session.pu_grip_confirm = 0
+
+                # 状态机（只有开始抓杆后才计数）
+                if session.pu_grip_started:
+                    # 判定是否拉起到位：鼻子比肩线高（上拉时手臂自然弯曲，不做限制）
+                    is_up = nose["y"] < shoulder_y - PULL_UP_UP_Y_THRESH
+                    # 判定是否下放到位：鼻子比肩线低 且 手臂伸直（回到悬垂起点）
+                    is_down = nose["y"] > shoulder_y + PULL_UP_DOWN_Y_THRESH and arm_straight
+
+                    if session.pu_state == STATE_PU_READY:
+                        # 基准状态：手臂伸直悬垂，看是否拉起到位
+                        if is_up:
+                            session.pu_debounce += 1
+                            if session.pu_debounce >= PU_DEBOUNCE_FRAMES:
+                                session.pu_state = STATE_PU_UP
+                                session.pu_debounce = 0
+                                response["tip"] = "💪 拉起到位！下放计数"
+                        else:
+                            session.pu_debounce = 0
+
+                    elif session.pu_state == STATE_PU_UP:
+                        # 拉起状态，看是否下放回到基准（必须手臂伸直）
+                        if is_down:
+                            session.pu_debounce += 1
+                            if session.pu_debounce >= PU_DEBOUNCE_FRAMES:
+                                session.pu_count += 1
+                                response["tip"] = f"✅ 完成第{session.pu_count}个！"
+                                session.pu_state = STATE_PU_READY
+                                session.pu_debounce = 0
+                        else:
+                            session.pu_debounce = 0
+
+                # 实时分数
+                current_score = count_to_score(session.pu_count, PULL_UP_FULL)
+                response["score"] = current_score
+                response["count"] = session.pu_count
+
+                # 拼接提示文本
+                if not session.pu_grip_started:
+                    response["tip"] = "请跳上去抓杆（双手举过肩+手臂伸直保持1秒）..."
+                elif session.pu_tip_timer > 0:
+                    # 显示抓杆成功提示，持续2秒
+                    response["tip"] = session.pu_tip_text
+                    session.pu_tip_timer -= 1
+                response["tip"] += f" | 分数:{current_score:.0f}"
 
             # 深蹲计数
             elif session.current_test == TEST_SQUAT and len(lm_list) >= 27:
@@ -533,7 +613,6 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 r_knee = lm_list[26]
                 hip_y = (l_hip["y"] + r_hip["y"]) / 2
                 knee_y = (l_knee["y"] + r_knee["y"]) / 2
-                response["tip"] = f"髋y:{hip_y:.3f},膝y:{knee_y:.3f}"
 
                 if session.squat_state == STATE_STAND:
                     if knee_y > hip_y + SQUAT_THRESHOLD:
@@ -541,9 +620,12 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 elif session.squat_state == STATE_SQUAT:
                     if knee_y < hip_y - SQUAT_THRESHOLD:
                         session.squat_count += 1
-                        response["tip"] = "✅深蹲完成！"
                         session.squat_state = STATE_STAND
+
+                current_score = count_to_score(session.squat_count, SQUAT_FULL)
+                response["score"] = current_score
                 response["count"] = session.squat_count
+                response["tip"] = f"深蹲:{session.squat_count}个 | 分数:{current_score:.0f}"
 
             # 俯卧撑计数
             elif session.current_test == TEST_PUSHUP and len(lm_list) >= 16:
@@ -551,7 +633,6 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 l_elbow = lm_list[13]
                 l_wrist = lm_list[15]
                 angle = calc_angle(l_shoulder, l_elbow, l_wrist)
-                response["tip"] = f"手肘角度:{angle:.1f}°"
 
                 if session.pushup_state == STATE_UP:
                     if angle < PUSHUP_DOWN_ANGLE:
@@ -559,9 +640,12 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 elif session.pushup_state == STATE_DOWN:
                     if angle > PUSHUP_UP_ANGLE:
                         session.pushup_count += 1
-                        response["tip"] = "💪俯卧撑完成！"
                         session.pushup_state = STATE_UP
+
+                current_score = count_to_score(session.pushup_count, PUSHUP_FULL)
+                response["score"] = current_score
                 response["count"] = session.pushup_count
+                response["tip"] = f"俯卧撑:{session.pushup_count}个 | 分数:{current_score:.0f}"
 
     else:
         # ===== 人脸识别 =====
