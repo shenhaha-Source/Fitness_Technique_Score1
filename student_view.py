@@ -3,6 +3,10 @@
 ================================
 包含学生所有页面：主页、引体向上测试、深蹲测试、俯卧撑测试、颜值趣味测评、我的成绩。
 
+布局特点：
+- 深色星空背景（由全局 gui.py 提供）
+- 纵向通栏长条按钮竖向排列，宽度跟随窗口自适应
+- 成绩分行纵向展示
 打分规则：
 - 引体向上：15次满分（100分）
 - 深蹲：30次满分（100分）
@@ -40,9 +44,54 @@ BTN_HEIGHT = 46
 SIDE_PAD = 30  # 左右边距
 
 
+# ==========================================
+# 🌟 新增：通用的带背景图的 Frame 辅助类
+# ==========================================
+class BgFrame(tk.Frame):
+    """一个自带自适应背景图的容器，供各个子页面继承"""
+    def __init__(self, parent, image_path="bg_log2.jpg"):
+        super().__init__(parent, bg=BG_COLOR)
+        self.bg_canvas = tk.Canvas(self, highlightthickness=0, bg=BG_COLOR)
+        self.bg_canvas.pack(fill="both", expand=True)
+        
+        self.bg_photo = None
+        self.original_image = None
+        try:
+            self.original_image = Image.open(image_path)
+        except Exception as e:
+            print(f"⚠️ 学生端背景加载失败 ({image_path}): {e}")
+            
+        self.bg_canvas.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event):
+        if not self.original_image: return
+        new_w, new_h = event.width, event.height
+        if new_w < 100 or new_h < 100: return
+        
+        img_w, img_h = self.original_image.size
+        ratio = max(new_w / img_w, new_h / img_h)
+        resized_image = self.original_image.resize((int(img_w * ratio), int(img_h * ratio)), Image.Resampling.LANCZOS)
+        
+        left = (int(img_w * ratio) - new_w) // 2
+        top = (int(img_h * ratio) - new_h) // 2
+        cropped_image = resized_image.crop((left, top, left + new_w, top + new_h))
+        
+        self.bg_photo = ImageTk.PhotoImage(cropped_image)
+        self.bg_canvas.delete("bg")
+        self.bg_canvas.create_image(0, 0, image=self.bg_photo, anchor="nw", tags="bg")
+        self.bg_canvas.tag_lower("bg")
+
+
 class StudentView(tk.Frame):
     """
     学生端主视图容器，管理所有子页面切换。
+
+    Args:
+        parent: 父容器
+        send_command: 发送业务命令的回调函数
+        send_image_frame: 发送图像帧的回调函数
+        user_info: 当前登录用户信息
+        on_logout: 退出登录回调
     """
 
     def __init__(self, parent, send_command, send_image_frame, user_info, on_logout):
@@ -81,16 +130,17 @@ class StudentView(tk.Frame):
 
 
 # ---------------------- 学生主页 ----------------------
-class HomePage(tk.Frame):
+# 🌟 修改点：继承 BgFrame
+class HomePage(BgFrame):
     """学生主页，纵向通栏长条按钮布局，宽度自适应"""
 
     def __init__(self, parent, sv: StudentView):
-        super().__init__(parent, bg=BG_COLOR)
+        super().__init__(parent)  # 加载背景
         self.sv = sv
 
         # 头部通栏卡片
-        header = tk.Frame(self, bg=CARD_BG, height=50)
-        header.pack(fill="x", pady=(20, 10), padx=SIDE_PAD)
+        header = tk.Frame(self.bg_canvas, bg=CARD_BG, height=50)
+        header.place(relx=0.05, rely=0.05, relwidth=0.9, height=50)
 
         tk.Label(
             header, text=f"👋 {sv.user_info['name']} 同学",
@@ -110,9 +160,9 @@ class HomePage(tk.Frame):
 
         # 标题
         tk.Label(
-            self, text="体测评分",
-            font=("微软雅黑", 24, "bold"), fg=PRIMARY, bg=BG_COLOR
-        ).pack(pady=(10, 15))
+            self.bg_canvas, text="体测评分",
+            font=("微软雅黑", 24, "bold"), fg=PRIMARY, bg=CARD_BG, padx=20, pady=5
+        ).place(relx=0.5, rely=0.2, anchor="center")
 
         # 测评按钮组（纵向通栏长条，宽度自适应）
         btn_info = [
@@ -123,25 +173,29 @@ class HomePage(tk.Frame):
             ("📊 我的成绩", lambda: sv.show_page(MyScorePage), SUCCESS),
         ]
 
+        btn_frame = tk.Frame(self.bg_canvas, bg=BG_COLOR)
+        btn_frame.place(relx=0.5, rely=0.6, anchor="center", relwidth=0.5)
+
         for text, cmd, color in btn_info:
             btn = tk.Button(
-                self, text=text, command=cmd,
+                btn_frame, text=text, command=cmd,
                 font=("微软雅黑", 13, "bold"),
                 height=2, bg=color, fg="#0B1020", relief=tk.FLAT,
                 cursor="hand2", activebackground=CARD_HOVER, activeforeground=TEXT_MAIN,
                 bd=0, padx=10, pady=6
             )
-            btn.pack(fill="x", pady=6, padx=SIDE_PAD)
+            btn.pack(fill="x", pady=6)
 
 
 # ---------------------- 通用测试页基类 ----------------------
-class BaseTestPage(tk.Frame):
+# 🌟 修改点：继承 BgFrame
+class BaseTestPage(BgFrame):
     """
     测试页基类，封装通用的摄像头、开始/停止、画面渲染逻辑。
     """
 
     def __init__(self, parent, sv: StudentView, title: str, color: str, test_type: int, image_mode: int):
-        super().__init__(parent, bg=BG_COLOR)
+        super().__init__(parent)
         self.sv = sv
         self.test_type = test_type
         self.image_mode = image_mode
@@ -151,8 +205,8 @@ class BaseTestPage(tk.Frame):
         self.auto_stopped = False  # 是否自动停止（引体向上掉落）
 
         # 顶部导航
-        top = tk.Frame(self, bg=CARD_BG, height=50)
-        top.pack(fill="x", pady=(15, 10), padx=SIDE_PAD)
+        top = tk.Frame(self.bg_canvas, bg=CARD_BG, height=50)
+        top.place(relx=0.05, rely=0.03, relwidth=0.9, height=50)
 
         tk.Button(
             top, text="← 返回", command=self.stop_and_back,
@@ -164,24 +218,23 @@ class BaseTestPage(tk.Frame):
             top, text=title, font=("微软雅黑", 15, "bold"), fg=TEXT_MAIN, bg=CARD_BG
         ).pack(side=tk.LEFT, padx=30)
 
-        # 摄像头预览卡片（宽度自适应，高度固定）
-        cam_card = tk.Frame(self, bg=CARD_BG, height=360)
-        cam_card.pack(fill="x", pady=(10, 10), padx=SIDE_PAD)
-        cam_card.pack_propagate(False)  # 固定高度，不让内容撑大
+        # 摄像头预览卡片
+        cam_card = tk.Frame(self.bg_canvas, bg=CARD_BG, height=360)
+        cam_card.place(relx=0.1, rely=0.15, relwidth=0.8, height=360)
 
         self.img_label = tk.Label(cam_card, bg=CARD_BG, text="摄像头预览", fg=TEXT_SUB)
         self.img_label.pack(fill="both", expand=True, padx=10, pady=10)
 
         # 状态信息
         self.info = tk.Label(
-            self, text="准备就绪", font=("微软雅黑", 14, "bold"),
-            fg=color, bg=BG_COLOR
+            self.bg_canvas, text="准备就绪", font=("微软雅黑", 14, "bold"),
+            fg=color, bg=CARD_BG, padx=15, pady=5
         )
-        self.info.pack(pady=(5, 10))
+        self.info.place(relx=0.5, rely=0.62, anchor="center")
 
-        # 控制按钮区（两个并排，宽度自适应）
-        ctrl = tk.Frame(self, bg=BG_COLOR)
-        ctrl.pack(fill="x", pady=(5, 15), padx=SIDE_PAD)
+        # 控制按钮区
+        ctrl = tk.Frame(self.bg_canvas, bg=BG_COLOR)
+        ctrl.place(relx=0.2, rely=0.72, relwidth=0.6)
         ctrl.grid_columnconfigure(0, weight=1)
         ctrl.grid_columnconfigure(1, weight=1)
 
@@ -274,9 +327,11 @@ class BaseTestPage(tk.Frame):
             img_ratio = img.width / img.height
             label_ratio = w / h
             if img_ratio > label_ratio:
+                # 图片更宽，按宽度适配
                 new_w = w
                 new_h = int(w / img_ratio)
             else:
+                # 图片更高，按高度适配
                 new_h = h
                 new_w = int(h * img_ratio)
             img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
@@ -287,6 +342,7 @@ class BaseTestPage(tk.Frame):
     def on_frame_result(self, res: dict, frame):
         """子类可重写：处理后端返回的帧结果"""
         pass
+
 
 # ---------------------- 引体向上测试 ----------------------
 class PullUpTestPage(BaseTestPage):
@@ -364,16 +420,17 @@ class FaceScorePage(BaseTestPage):
 
 
 # ---------------------- 我的成绩 ----------------------
-class MyScorePage(tk.Frame):
+# 🌟 修改点：继承 BgFrame
+class MyScorePage(BgFrame):
     """学生查看自己的三项最优成绩和总分（纵向分行展示）"""
 
     def __init__(self, parent, sv: StudentView):
-        super().__init__(parent, bg=BG_COLOR)
+        super().__init__(parent)
         self.sv = sv
 
         # 顶部导航
-        top = tk.Frame(self, bg=CARD_BG, height=50)
-        top.pack(fill="x", pady=(15, 10), padx=SIDE_PAD)
+        top = tk.Frame(self.bg_canvas, bg=CARD_BG, height=50)
+        top.place(relx=0.05, rely=0.05, relwidth=0.9, height=50)
 
         tk.Button(
             top, text="← 返回", command=lambda: sv.show_page(HomePage),
@@ -387,8 +444,8 @@ class MyScorePage(tk.Frame):
         ).pack(side=tk.LEFT, padx=30)
 
         # 成绩卡片容器
-        self.score_frame = tk.Frame(self, bg=CARD_BG)
-        self.score_frame.pack(fill="x", pady=(10, 10), padx=SIDE_PAD)
+        self.score_frame = tk.Frame(self.bg_canvas, bg=CARD_BG)
+        self.score_frame.place(relx=0.2, rely=0.25, relwidth=0.6, relheight=0.6)
 
     def refresh(self):
         """从后端拉取我的成绩，纵向分行展示"""
