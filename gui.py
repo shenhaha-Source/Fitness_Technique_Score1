@@ -14,7 +14,6 @@ import os
 from login_view import LoginView
 from student_view import StudentView
 from teacher_view import TeacherView
-from star_bg import StarBackground
 import server as backend_server
 
 HOST = "127.0.0.1"
@@ -35,10 +34,12 @@ BG_COLOR = "#0B1020"
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("体测评分系统")
-        self.geometry("720x600")
+        self.title("智慧体测 · AI 动作测评")
+        self.geometry("720x640")
+        self.minsize(720, 640)
         self.resizable(True, True)
         self.configure(bg=BG_COLOR)
+        self._set_window_icon()
 
         self.server_thread = None
         self.sock = None
@@ -50,18 +51,33 @@ class MainApp(tk.Tk):
         self.start_backend()
         self.after(800, self.connect_server)
 
-        # 全局星空背景（常驻底层，不随页面销毁）
-        self.star_bg = StarBackground(self, star_count=100, mode="full")
-        self.star_bg.place(x=0, y=0, relwidth=1, relheight=1)
-        self.star_bg.animate()
-
-        # 主容器（放在星空之上）
+        # 主容器（登录页自带渐变/星光背景，其他页面使用深色底）
         self.container = tk.Frame(self, bg=BG_COLOR)
         self.container.place(x=0, y=0, relwidth=1, relheight=1)
         self.container.grid_rowconfigure(0, weight=1)
         self.container.grid_columnconfigure(0, weight=1)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _set_window_icon(self):
+        """设置窗口图标；中文路径/打包环境下失败也不影响启动。"""
+        if hasattr(sys, "_MEIPASS"):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_dir, "app.ico")
+        try:
+            self.iconbitmap(icon_path)
+            return
+        except Exception:
+            pass
+        try:
+            img = Image.open(icon_path).convert("RGBA")
+            img.thumbnail((64, 64), Image.LANCZOS)
+            self._icon_photo = ImageTk.PhotoImage(img)
+            self.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
 
     # ========== 后端服务管理（同进程后台线程） ==========
     def start_backend(self):
@@ -91,8 +107,6 @@ class MainApp(tk.Tk):
         self._clear_current_view()
         self.session_id = None
         self.user_info = None
-        # 切换为完整星空模式
-        self.star_bg.set_mode("full")
 
         self.login_view = LoginView(
             self.container,
@@ -107,8 +121,6 @@ class MainApp(tk.Tk):
         self._clear_current_view()
 
         if self.user_info["role"] == "teacher":
-            # 教师页切换为稀疏星光模式
-            self.star_bg.set_mode("sparse")
             self.current_view = TeacherView(
                 self.container,
                 send_command=self.send_command,
@@ -116,8 +128,6 @@ class MainApp(tk.Tk):
                 on_logout=self.logout
             )
         else:
-            # 学生页保持完整星空
-            self.star_bg.set_mode("full")
             self.current_view = StudentView(
                 self.container,
                 send_command=self.send_command,
