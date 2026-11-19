@@ -23,10 +23,12 @@ import time
 import hashlib
 import uuid
 import os
+from contextlib import contextmanager
 
 
 # ========== 全局配置 ==========
 SESSION_TIMEOUT = 3600  # 会话有效期：1小时（滑动过期）
+DB_TIMEOUT = 5         # SQLite 等锁时间（秒）
 
 # 打分标准：多少次满分
 PULL_UP_FULL = 15    # 引体向上15次满分
@@ -69,6 +71,23 @@ def get_db_path():
 DB_PATH = get_db_path()
 
 
+@contextmanager
+def get_conn():
+    """
+    打开一个短连接，并保证无论成功还是异常都会 close()。
+
+    为什么必须用 finally 关闭：
+    SQLite 的写锁属于连接。一次失败的 INSERT（例如重复用户名）如果让
+    连接对象一直活着，未回滚的事务会继续持有写锁，随后所有 create_session
+    都会等到超时，表现为“登录失败”。不要依赖垃圾回收来释放连接。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 # ========== 密码工具 ==========
 def get_pwd_hash(raw_pwd: str) -> str:
     """
@@ -82,58 +101,57 @@ def init_db():
     """
     初始化数据库，创建所有表（如果不存在）。
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    with get_conn() as conn:
+        cur = conn.cursor()
 
-    # 1. 用户表
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL,
-        name TEXT,
-        student_id TEXT
-    )
-    ''')
+        # 1. 用户表
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            name TEXT,
+            student_id TEXT
+        )
+        ''')
 
-    # 2. 会话表
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        expire_time REAL NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-    )
-    ''')
+        # 2. 会话表
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expire_time REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
 
-    # 3. 学生正式体测最优成绩表（每个学生一行，仅存最高分）
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS student_best_score (
-        user_id INTEGER PRIMARY KEY,
-        squat INTEGER DEFAULT 0,
-        pull_up INTEGER DEFAULT 0,
-        pushup INTEGER DEFAULT 0,
-        last_update TEXT,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-    )
-    ''')
+        # 3. 学生正式体测最优成绩表（每个学生一行，仅存最高分）
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS student_best_score (
+            user_id INTEGER PRIMARY KEY,
+            squat INTEGER DEFAULT 0,
+            pull_up INTEGER DEFAULT 0,
+            pushup INTEGER DEFAULT 0,
+            last_update TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
 
-    # 4. 趣味颜值评分记录表
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS face_fun_record (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        score REAL,
-        create_time TEXT,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-    )
-    ''')
+        # 4. 趣味颜值评分记录表
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS face_fun_record (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            score REAL,
+            create_time TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
-    # 预置测试账号
+    # 预置测试账号（在初始化连接关闭之后再做，避免读连接和写连接同时持有锁）
     _seed_test_users()
 
 
@@ -141,17 +159,16 @@ def _seed_test_users():
     """
     预置演示测试账号（仅保留老师账号，学生不预置）。
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users WHERE role='teacher'")
-    count = cur.fetchone()[0]
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users WHERE role='teacher'")
+        count = cur.fetchone()[0]
+
     if count > 0:
-        conn.close()
         return
 
     # 只预置老师账号，不预置学生
     add_user("tea01", "123456", "teacher", "李老师", "T001")
-    conn.close()
     print("✅ 已预置老师账号：tea01/123456")
 
 
@@ -161,26 +178,26 @@ def add_user(username: str, raw_pwd: str, role: str, name: str, student_id: str 
     注册新用户。学生注册时自动初始化一行全0的成绩记录。
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        pwd_hash = get_pwd_hash(raw_pwd)
-        cur.execute(
-            "INSERT INTO users (username, password_hash, role, name, student_id) VALUES (?,?,?,?,?)",
-            (username, pwd_hash, role, name, student_id)
-        )
-        user_id = cur.lastrowid
-
-        if role == "student":
-            now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with get_conn() as conn:
+            cur = conn.cursor()
+            pwd_hash = get_pwd_hash(raw_pwd)
             cur.execute(
-                "INSERT INTO student_best_score (user_id, squat, pull_up, pushup, last_update) VALUES (?,?,?,?,?)",
-                (user_id, 0, 0, 0, now)
+                "INSERT INTO users (username, password_hash, role, name, student_id) VALUES (?,?,?,?,?)",
+                (username, pwd_hash, role, name, student_id)
             )
+            user_id = cur.lastrowid
 
-        conn.commit()
-        conn.close()
+            if role == "student":
+                now = time.strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    "INSERT INTO student_best_score (user_id, squat, pull_up, pushup, last_update) VALUES (?,?,?,?,?)",
+                    (user_id, 0, 0, 0, now)
+                )
+
+            conn.commit()
         return True
     except sqlite3.IntegrityError:
+        # get_conn() 已经在 with 退出时 close()，失败的 INSERT 会随连接一起回滚。
         return False
 
 
@@ -188,15 +205,15 @@ def login_user(username: str, raw_pwd: str):
     """
     校验用户名密码，登录成功返回用户信息。
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
     pwd_hash = get_pwd_hash(raw_pwd)
-    cur.execute(
-        "SELECT id, username, role, name, student_id FROM users WHERE username=? AND password_hash=?",
-        (username, pwd_hash)
-    )
-    row = cur.fetchone()
-    conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, username, role, name, student_id FROM users WHERE username=? AND password_hash=?",
+            (username, pwd_hash)
+        )
+        row = cur.fetchone()
+
     if row:
         return {
             "uid": row[0],
@@ -215,14 +232,13 @@ def create_session(user_id: int) -> str:
     """
     session_id = uuid.uuid4().hex
     expire_time = time.time() + SESSION_TIMEOUT
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sessions (session_id, user_id, expire_time) VALUES (?,?,?)",
-        (session_id, user_id, expire_time)
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO sessions (session_id, user_id, expire_time) VALUES (?,?,?)",
+            (session_id, user_id, expire_time)
+        )
+        conn.commit()
     return session_id
 
 
@@ -231,32 +247,29 @@ def check_session(session_id: str):
     校验会话是否有效，有效则自动续期（滑动过期）。
     """
     now = time.time()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    with get_conn() as conn:
+        cur = conn.cursor()
 
-    cur.execute('''
-        SELECT u.id, u.username, u.role, u.name, u.student_id, s.expire_time
-        FROM sessions s
-        JOIN users u ON s.user_id = u.id
-        WHERE s.session_id = ?
-    ''', (session_id,))
-    row = cur.fetchone()
+        cur.execute('''
+            SELECT u.id, u.username, u.role, u.name, u.student_id, s.expire_time
+            FROM sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.session_id = ?
+        ''', (session_id,))
+        row = cur.fetchone()
 
-    if not row:
-        conn.close()
-        return None
+        if not row:
+            return None
 
-    expire_time = row[5]
-    if expire_time < now:
-        cur.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+        expire_time = row[5]
+        if expire_time < now:
+            cur.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+            conn.commit()
+            return None
+
+        new_expire = now + SESSION_TIMEOUT
+        cur.execute("UPDATE sessions SET expire_time=? WHERE session_id=?", (new_expire, session_id))
         conn.commit()
-        conn.close()
-        return None
-
-    new_expire = now + SESSION_TIMEOUT
-    cur.execute("UPDATE sessions SET expire_time=? WHERE session_id=?", (new_expire, session_id))
-    conn.commit()
-    conn.close()
 
     return {
         "uid": row[0],
@@ -294,14 +307,13 @@ def get_student_best(uid: int) -> dict:
     Returns:
         dict: {squat, pull_up, pushup, squat_score, pull_up_score, pushup_score, total, last_update}
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT squat, pull_up, pushup, last_update FROM student_best_score WHERE user_id=?",
-        (uid,)
-    )
-    row = cur.fetchone()
-    conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT squat, pull_up, pushup, last_update FROM student_best_score WHERE user_id=?",
+            (uid,)
+        )
+        row = cur.fetchone()
 
     if row:
         squat, pull_up, pushup, last_update = row
@@ -343,35 +355,32 @@ def update_best_score(uid: int, mode: str, new_val: int) -> bool:
     if mode not in valid_modes:
         return False
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    with get_conn() as conn:
+        cur = conn.cursor()
 
-    cur.execute(f"SELECT {mode} FROM student_best_score WHERE user_id=?", (uid,))
-    row = cur.fetchone()
+        cur.execute(f"SELECT {mode} FROM student_best_score WHERE user_id=?", (uid,))
+        row = cur.fetchone()
 
-    if not row:
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute(
-            f"INSERT INTO student_best_score (user_id, {mode}, last_update) VALUES (?,?,?)",
-            (uid, new_val, now)
-        )
-        conn.commit()
-        conn.close()
-        return True
+        if not row:
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute(
+                f"INSERT INTO student_best_score (user_id, {mode}, last_update) VALUES (?,?,?)",
+                (uid, new_val, now)
+            )
+            conn.commit()
+            return True
 
-    old_val = row[0]
-    if new_val > old_val:
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute(
-            f"UPDATE student_best_score SET {mode}=?, last_update=? WHERE user_id=?",
-            (new_val, now, uid)
-        )
-        conn.commit()
-        conn.close()
-        return True
+        old_val = row[0]
+        if new_val > old_val:
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute(
+                f"UPDATE student_best_score SET {mode}=?, last_update=? WHERE user_id=?",
+                (new_val, now, uid)
+            )
+            conn.commit()
+            return True
 
-    conn.close()
-    return False
+        return False
 
 
 def get_all_student_score_for_teacher() -> list:
@@ -381,21 +390,20 @@ def get_all_student_score_for_teacher() -> list:
     Returns:
         list: 每行 [name, student_id, squat, squat_score, pull_up, pull_up_score, pushup, pushup_score, total]
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT u.name, u.student_id, 
-               COALESCE(s.squat, 0), 
-               COALESCE(s.pull_up, 0), 
-               COALESCE(s.pushup, 0),
-               s.last_update
-        FROM users u
-        LEFT JOIN student_best_score s ON u.id = s.user_id
-        WHERE u.role = 'student'
-        ORDER BY u.id ASC
-    ''')
-    rows = cur.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT u.name, u.student_id,
+                   COALESCE(s.squat, 0),
+                   COALESCE(s.pull_up, 0),
+                   COALESCE(s.pushup, 0),
+                   s.last_update
+            FROM users u
+            LEFT JOIN student_best_score s ON u.id = s.user_id
+            WHERE u.role = 'student'
+            ORDER BY u.id ASC
+        ''')
+        rows = cur.fetchall()
 
     result = []
     for row in rows:
@@ -418,23 +426,21 @@ def delete_student_score(name: str) -> bool:
     Returns:
         bool: True=删除成功；False=没找到
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # 先找到用户ID
-    cur.execute("SELECT id FROM users WHERE name=? AND role='student'", (name,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return False
-    uid = row[0]
-    # 把成绩清零
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
-        "UPDATE student_best_score SET squat=0, pull_up=0, pushup=0, last_update=? WHERE user_id=?",
-        (now, uid)
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 先找到用户ID
+        cur.execute("SELECT id FROM users WHERE name=? AND role='student'", (name,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        uid = row[0]
+        # 把成绩清零
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute(
+            "UPDATE student_best_score SET squat=0, pull_up=0, pushup=0, last_update=? WHERE user_id=?",
+            (now, uid)
+        )
+        conn.commit()
     return True
 
 
@@ -443,15 +449,14 @@ def add_face_record(uid: int, score: float):
     """
     保存一条趣味颜值评分记录。
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
-        "INSERT INTO face_fun_record (user_id, score, create_time) VALUES (?,?,?)",
-        (uid, score, now)
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute(
+            "INSERT INTO face_fun_record (user_id, score, create_time) VALUES (?,?,?)",
+            (uid, score, now)
+        )
+        conn.commit()
 
 
 # ========== 测试入口 ==========
