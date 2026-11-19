@@ -19,6 +19,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
+from audio import AudioPlayer, select_count_cue
+
 # 命令码
 CMD_START_TEST = 0x81
 CMD_STOP_TEST = 0x82
@@ -101,6 +103,9 @@ class StudentView(tk.Frame):
         self.user_info = user_info
         self.on_logout = on_logout
 
+        # 整个学生端共用一个播放器；所有测试页共享静音状态
+        self.audio = AudioPlayer()
+
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -127,6 +132,27 @@ class StudentView(tk.Frame):
         self.pages[page_class].tkraise()
         if page_class == MyScorePage:
             self.pages[page_class].refresh()
+
+    def toggle_audio(self):
+        """切换静音，并同步所有测试页的按钮文字。"""
+        muted = self.audio.toggle_muted()
+        for page in self.pages.values():
+            btn = getattr(page, "audio_btn", None)
+            if btn is not None:
+                try:
+                    btn.config(
+                        text="开启声音" if muted else "关闭声音",
+                        fg=SUCCESS if muted else TEXT_SUB,
+                    )
+                except tk.TclError:
+                    pass
+
+    def destroy(self):
+        try:
+            self.audio.stop()
+        except Exception:
+            pass
+        super().destroy()
 
 
 # ---------------------- 学生主页 ----------------------
@@ -203,6 +229,12 @@ class BaseTestPage(BgFrame):
         self.cap = None
         self.imgtk = None
         self.auto_stopped = False  # 是否自动停止（引体向上掉落）
+        self._last_count = 0
+        self._target = {
+            TEST_PULL_UP: 15,
+            TEST_SQUAT: 30,
+            TEST_PUSHUP: 25,
+        }.get(test_type, 0)
 
         # 顶部导航
         top = tk.Frame(self.bg_canvas, bg=CARD_BG, height=50)
@@ -218,6 +250,19 @@ class BaseTestPage(BgFrame):
             top, text=title, font=("微软雅黑", 15, "bold"), fg=TEXT_MAIN, bg=CARD_BG
         ).pack(side=tk.LEFT, padx=30)
 
+        self.audio_btn = tk.Button(
+            top,
+            text="开启声音" if self.sv.audio.muted else "关闭声音",
+            command=self.sv.toggle_audio,
+            font=("微软雅黑", 10),
+            bg=CARD_BG,
+            fg=SUCCESS if self.sv.audio.muted else TEXT_SUB,
+            activebackground=CARD_HOVER,
+            activeforeground=TEXT_MAIN,
+            relief=tk.FLAT, bd=0, cursor="hand2", padx=10, pady=4,
+        )
+        self.audio_btn.pack(side=tk.RIGHT, padx=10)
+
         # 摄像头预览卡片
         cam_card = tk.Frame(self.bg_canvas, bg=CARD_BG, height=360)
         cam_card.place(relx=0.1, rely=0.15, relwidth=0.8, height=360)
@@ -231,6 +276,13 @@ class BaseTestPage(BgFrame):
             fg=color, bg=CARD_BG, padx=15, pady=5
         )
         self.info.place(relx=0.5, rely=0.62, anchor="center")
+
+        # 服务端中文 tip 用 Tk 标签显示；不要再用 cv2.putText 画到视频上
+        self.hint = tk.Label(
+            self.bg_canvas, text="", font=("微软雅黑", 10), fg=TEXT_SUB,
+            bg=CARD_BG, padx=10, pady=3, wraplength=620, justify="center",
+        )
+        self.hint.place(relx=0.5, rely=0.665, anchor="center")
 
         # 控制按钮区
         ctrl = tk.Frame(self.bg_canvas, bg=BG_COLOR)
@@ -274,17 +326,27 @@ class BaseTestPage(BgFrame):
             return
 
         self.is_running = True
+        self._last_count = 0
+        self.hint.config(text="")
+
+        # 所有测试页（包括颜值页）都有开始提示；颜值页只是不播计数音
+        self.sv.audio.play_sequence(("start_tone", "start"))
+
         self.on_start()
         self.update_frame()
 
     def stop(self):
         """停止测试"""
+        was_running = self.is_running
         self.is_running = False
         if self.cap:
             self.cap.release()
             self.cap = None
         self.sv.send_command(CMD_STOP_TEST)
         self.on_stop()
+
+        if was_running:
+            self.sv.audio.play("stop")
 
     def on_start(self):
         """子类可重写：开始测试时的初始化"""
@@ -312,10 +374,12 @@ class BaseTestPage(BgFrame):
             self.auto_stopped = True
             count = res.get("count", 0)
             score = res.get("score") or 0
-            messagebox.showinfo("测试结束", f"已掉落，测试结束！\n完成次数：{count}\n得分：{score:.0f}分")
+            # 先停测试并播结束音，再弹提示
             self.stop()
+            messagebox.showinfo("测试结束", f"已掉落，测试结束！\n完成次数：{count}\n得分：{score:.0f}分")
             return
 
+        self._handle_audio(res)
         self.on_frame_result(res, frame)
 
         # 等比例缩放显示，不拉伸变形
@@ -339,6 +403,32 @@ class BaseTestPage(BgFrame):
             self.img_label.config(image=self.imgtk, text="")
         self.after(15, self.update_frame)
 
+    def _handle_audio(self, res: dict):
+        """
+        只在“检测到人 + 计数增加”时出声。
+
+        服务端在无人/出画时会返回 success=False、count=0，
+        这里必须跳过，否则人回到画面时会把旧计数当成新动作重复响。
+        """
+        if self.test_type == TEST_FACE:
+            return
+        if not res.get("success"):
+            return
+
+        try:
+            count = int(res.get("count", 0) or 0)
+        except (TypeError, ValueError):
+            return
+
+        if count < self._last_count:
+            self._last_count = count
+            return
+
+        cue = select_count_cue(self._last_count, count, self._target)
+        if cue:
+            self.sv.audio.play(cue)
+        self._last_count = count
+
     def on_frame_result(self, res: dict, frame):
         """子类可重写：处理后端返回的帧结果"""
         pass
@@ -359,7 +449,7 @@ class PullUpTestPage(BaseTestPage):
         count = res.get("count", 0)
         score = res.get("score") or 0
         self.info.config(text=f"引体向上：{count}个 | 得分：{score:.0f}分")
-        cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        self.hint.config(text=tip)
 
 
 # ---------------------- 深蹲测试 ----------------------
@@ -377,7 +467,7 @@ class SquatTestPage(BaseTestPage):
         count = res.get("count", 0)
         score = res.get("score") or 0
         self.info.config(text=f"深蹲：{count}个 | 得分：{score:.0f}分")
-        cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        self.hint.config(text=tip)
 
 
 # ---------------------- 俯卧撑测试 ----------------------
@@ -395,7 +485,7 @@ class PushupTestPage(BaseTestPage):
         count = res.get("count", 0)
         score = res.get("score") or 0
         self.info.config(text=f"俯卧撑：{count}个 | 得分：{score:.0f}分")
-        cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        self.hint.config(text=tip)
 
 
 # ---------------------- 颜值趣味测评 ----------------------
@@ -416,7 +506,7 @@ class FaceScorePage(BaseTestPage):
         score = res.get("score")
         if score is not None:
             self.info.config(text=f"颜值分数：{score:.1f}（趣味，不计入成绩）")
-        cv2.putText(frame, tip, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        self.hint.config(text=tip)
 
 
 # ---------------------- 我的成绩 ----------------------
