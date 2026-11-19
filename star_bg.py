@@ -122,7 +122,7 @@ class StarBackground(tk.Canvas):
         w = self.winfo_width()
         h = self.winfo_height()
         if w < 100 or h < 100:
-            self.after(50, self.animate)
+            self.after(80, self.animate)
             return
 
         for star in self.stars:
@@ -139,4 +139,4 @@ class StarBackground(tk.Canvas):
                 star["y"] = -5
             self.coords(star["id"], star["x"], star["y"],
                         star["x"] + star["size"], star["y"] + star["size"])
-        self.after(50, self.animate)
+        self.after(80, self.animate)

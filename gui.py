@@ -43,6 +43,7 @@ class MainApp(tk.Tk):
 
         self.server_thread = None
         self.sock = None
+        self._socket_lock = threading.Lock()
         self.session_id = None
         self.user_info = None
         self.current_view = None
@@ -155,9 +156,7 @@ class MainApp(tk.Tk):
 
         try:
             data = json.dumps({"username": username, "password": password}).encode("utf-8")
-            self.sock.sendall(bytes([CMD_LOGIN]))
-            self.sock.sendall(len(data).to_bytes(4, byteorder="big"))
-            self.sock.sendall(data)
+            self.sock.sendall(bytes([CMD_LOGIN]) + len(data).to_bytes(4, byteorder="big") + data)
 
             res = self._recv_json()
             if res and res.get("ok"):
@@ -184,9 +183,7 @@ class MainApp(tk.Tk):
 
         try:
             data = json.dumps(form_data).encode("utf-8")
-            self.sock.sendall(bytes([CMD_REGISTER]))
-            self.sock.sendall(len(data).to_bytes(4, byteorder="big"))
-            self.sock.sendall(data)
+            self.sock.sendall(bytes([CMD_REGISTER]) + len(data).to_bytes(4, byteorder="big") + data)
 
             res = self._recv_json()
             if res and res.get("ok"):
@@ -200,27 +197,40 @@ class MainApp(tk.Tk):
     # ========== 通信：业务命令（自动带session） ==========
     def send_command(self, cmd_byte, extra=None):
         """发送业务命令，自动带 session_id"""
+        with self._socket_lock:
+            return self._send_command_locked(cmd_byte, extra)
+
+    def _send_command_locked(self, cmd_byte, extra=None):
         sock = self.sock
         if sock is None or self.session_id is None:
             return {"ok": False, "msg": "未登录"}
 
         try:
-            sock.sendall(bytes([cmd_byte]))
             sid_bytes = self.session_id.encode("utf-8")
-            sock.sendall(bytes([len(sid_bytes)]))
-            sock.sendall(sid_bytes)
+            request = bytes([cmd_byte, len(sid_bytes)]) + sid_bytes
             if extra:
-                sock.sendall(extra)
+                request += extra
+            sock.sendall(request)
 
             res = self._recv_json()
             if res and res.get("need_relogin"):
-                messagebox.showwarning("登录过期", res.get("msg", "请重新登录"))
-                self.show_login()
+                msg = res.get("msg", "请重新登录")
+                self.after(0, lambda: messagebox.showwarning("登录过期", msg))
+                self.after(0, self.show_login)
                 return {"ok": False, "msg": "会话失效"}
             return res or {"ok": False}
         except Exception as e:
             print(f"命令发送异常: {e}")
             return {"ok": False, "msg": str(e)}
+
+    def send_command_async(self, cmd_byte, extra=None):
+        """Run a command without waiting in Tk's event loop."""
+        threading.Thread(
+            target=self.send_command,
+            args=(cmd_byte, extra),
+            name="socket-command",
+            daemon=True,
+        ).start()
 
     def send_image_frame(self, mode, frame):
         """发送图像帧（不需要session，开始测试时已校验）"""
@@ -233,10 +243,9 @@ class MainApp(tk.Tk):
             if not success:
                 return None
             img_bytes = buf.tobytes()
-            sock.sendall(bytes([mode]))
-            sock.sendall(len(img_bytes).to_bytes(4, byteorder="big"))
-            sock.sendall(img_bytes)
-            return self._recv_json()
+            with self._socket_lock:
+                sock.sendall(bytes([mode]) + len(img_bytes).to_bytes(4, byteorder="big") + img_bytes)
+                return self._recv_json()
         except Exception as e:
             print(f"图像发送异常: {e}")
             return None
@@ -244,13 +253,17 @@ class MainApp(tk.Tk):
     def _recv_json(self, timeout=5.0):
         """接收一行JSON，带超时"""
         self.sock.settimeout(timeout)
-        raw = b""
+        raw = bytearray()
         try:
             while True:
-                c = self.sock.recv(1)
-                if c == b"\n" or not c:
+                chunk = self.sock.recv(4096)
+                if not chunk:
                     break
-                raw += c
+                newline = chunk.find(b"\n")
+                if newline >= 0:
+                    raw.extend(chunk[:newline])
+                    break
+                raw.extend(chunk)
         except socket.timeout:
             print("⚠️ 接收响应超时")
             return None

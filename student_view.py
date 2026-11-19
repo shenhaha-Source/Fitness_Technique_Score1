@@ -15,11 +15,13 @@
 """
 
 import cv2
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 from audio import AudioPlayer, select_count_cue
+from frame_pipeline import LatestFramePipeline
 
 # 命令码
 CMD_START_TEST = 0x81
@@ -127,6 +129,14 @@ class StudentView(tk.Frame):
 
         self.show_page(HomePage)
 
+    def send_command_async(self, cmd_byte, extra=None):
+        threading.Thread(
+            target=self.send_command,
+            args=(cmd_byte, extra),
+            name="student-socket-command",
+            daemon=True,
+        ).start()
+
     def show_page(self, page_class):
         """切换到指定页面"""
         self.pages[page_class].tkraise()
@@ -227,6 +237,9 @@ class BaseTestPage(BgFrame):
         self.image_mode = image_mode
         self.is_running = False
         self.cap = None
+        self.frame_pipeline = None
+        self._rendered_result_sequence = 0
+        self._rendered_frame_sequence = 0
         self.imgtk = None
         self.auto_stopped = False  # 是否自动停止（引体向上掉落）
         self._last_count = 0
@@ -320,12 +333,13 @@ class BaseTestPage(BgFrame):
             return
 
         # 打开摄像头
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            messagebox.showerror("错误", "摄像头打开失败")
-            return
-
         self.is_running = True
+        self.frame_pipeline = LatestFramePipeline(
+            self._open_camera,
+            lambda frame: self.sv.send_image_frame(self.image_mode, frame),
+        )
+        self._rendered_result_sequence = 0
+        self._rendered_frame_sequence = 0
         self._last_count = 0
         self.hint.config(text="")
 
@@ -333,16 +347,28 @@ class BaseTestPage(BgFrame):
         self.sv.audio.play_sequence(("start_tone", "start"))
 
         self.on_start()
+        self.frame_pipeline.start()
         self.update_frame()
+
+    @staticmethod
+    def _open_camera():
+        """Open the camera on the capture worker, not on Tk's event loop."""
+        capture = cv2.VideoCapture(0)
+        if not capture.isOpened():
+            capture.release()
+            return None
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return capture
 
     def stop(self):
         """停止测试"""
         was_running = self.is_running
         self.is_running = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        self.sv.send_command(CMD_STOP_TEST)
+        if self.frame_pipeline:
+            self.frame_pipeline.stop()
+            self.frame_pipeline = None
+        self.cap = None
+        self.sv.send_command_async(CMD_STOP_TEST)
         self.on_stop()
 
         if was_running:
@@ -357,51 +383,52 @@ class BaseTestPage(BgFrame):
         pass
 
     def update_frame(self):
-        """逐帧更新画面，保持视频原始比例不变形"""
+        """Render the newest captured frame and inference result on Tk's thread."""
         if not self.is_running:
             return
-        ret, frame = self.cap.read()
-        if not ret:
-            self.stop()
+        pipeline = self.frame_pipeline
+        if pipeline is None:
             return
-        res = self.sv.send_image_frame(self.image_mode, frame)
-        if res is None:
+        if pipeline.error:
+            error = pipeline.error
             self.stop()
-            return
-
-        # 检查是否自动停止（引体向上掉落）
-        if res.get("auto_stop") and not self.auto_stopped:
-            self.auto_stopped = True
-            count = res.get("count", 0)
-            score = res.get("score") or 0
-            # 先停测试并播结束音，再弹提示
-            self.stop()
-            messagebox.showinfo("测试结束", f"已掉落，测试结束！\n完成次数：{count}\n得分：{score:.0f}分")
+            messagebox.showerror("错误", error)
             return
 
-        self._handle_audio(res)
-        self.on_frame_result(res, frame)
+        latest = pipeline.latest_frame()
+        frame = latest[1] if latest else None
+        result_update = pipeline.latest_result(self._rendered_result_sequence)
+        if result_update:
+            result_sequence, (frame_sequence, result_frame, res) = result_update
+            self._rendered_result_sequence = result_sequence
+            if res is None:
+                self.stop()
+                return
 
-        # 等比例缩放显示，不拉伸变形
-        w, h = self.img_label.winfo_width(), self.img_label.winfo_height()
-        if w > 10 and h > 10:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
-            # 计算等比例缩放尺寸
-            img_ratio = img.width / img.height
-            label_ratio = w / h
-            if img_ratio > label_ratio:
-                # 图片更宽，按宽度适配
-                new_w = w
-                new_h = int(w / img_ratio)
-            else:
-                # 图片更高，按高度适配
-                new_h = h
-                new_w = int(h * img_ratio)
-            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            self.imgtk = ImageTk.PhotoImage(img)
-            self.img_label.config(image=self.imgtk, text="")
-        self.after(15, self.update_frame)
+            # 检查是否自动停止（引体向上掉落）
+            if res.get("auto_stop") and not self.auto_stopped:
+                self.auto_stopped = True
+                count = res.get("count", 0)
+                score = res.get("score") or 0
+                self.stop()
+                messagebox.showinfo("测试结束", f"已掉落，测试结束！\n完成次数：{count}\n得分：{score:.0f}分")
+                return
+
+            self._handle_audio(res)
+            self.on_frame_result(res, result_frame)
+
+        if frame is not None and latest[0] != self._rendered_frame_sequence:
+            self._rendered_frame_sequence = latest[0]
+            w, h = self.img_label.winfo_width(), self.img_label.winfo_height()
+            if w > 10 and h > 10:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                ratio = min(w / img.width, h / img.height)
+                new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+                img = img.resize(new_size, Image.Resampling.BILINEAR)
+                self.imgtk = ImageTk.PhotoImage(img)
+                self.img_label.config(image=self.imgtk, text="")
+        self.after(30, self.update_frame)
 
     def _handle_audio(self, res: dict):
         """

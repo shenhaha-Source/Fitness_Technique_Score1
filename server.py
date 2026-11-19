@@ -255,13 +255,13 @@ def recv_exact(conn, n: int) -> bytes:
     """
     精确读取 n 个字节，防止粘包。
     """
-    data = b""
+    data = bytearray()
     while len(data) < n:
         chunk = conn.recv(n - len(data))
         if not chunk:
             return None
-        data += chunk
-    return data
+        data.extend(chunk)
+    return bytes(data)
 
 
 def send_json(conn, obj: dict):
