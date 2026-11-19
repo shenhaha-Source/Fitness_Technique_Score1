@@ -1,0 +1,6 @@
+mediapipe==1.2.3
+opencv-contrib-python==4.11.0.86
+numpy==2.5.5
+Pillow==13.0.0
+PyInstaller==6.22.3
+psutil==7.2.2

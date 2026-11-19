@@ -44,6 +44,7 @@ class MainApp(tk.Tk):
         self.server_thread = None
         self.sock = None
         self._socket_lock = threading.Lock()
+        self._backend_error = None
         self.session_id = None
         self.user_info = None
         self.current_view = None
@@ -84,13 +85,20 @@ class MainApp(tk.Tk):
     def start_backend(self):
         # 开一个守护线程跑socket server，不会反复启动gui
         self.server_thread = threading.Thread(
-            target=backend_server.start_server,
+            target=self._run_backend,
             daemon=True
         )
         self.server_thread.start()
         print("✅ 后端服务已在后台线程启动")
 
-    def connect_server(self):
+    def _run_backend(self):
+        try:
+            backend_server.start_server()
+        except Exception as exc:
+            self._backend_error = exc
+            print(f"后端服务启动异常: {exc}")
+
+    def connect_server(self, retries=10):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(3.0)
@@ -98,9 +106,13 @@ class MainApp(tk.Tk):
             self.sock.settimeout(None)
             # 连接成功，显示登录页
             self.show_login()
-        except Exception:
+        except Exception as exc:
             self.sock = None
-            messagebox.showerror("错误", "后端推理服务启动失败！")
+            if retries > 0 and self._backend_error is None:
+                self.after(250, lambda: self.connect_server(retries - 1))
+                return
+            detail = f"\n{self._backend_error or exc}"
+            messagebox.showerror("错误", f"后端推理服务启动失败！{detail}")
 
     # ========== 页面切换 ==========
     def show_login(self):

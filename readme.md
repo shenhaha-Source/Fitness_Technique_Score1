@@ -115,7 +115,7 @@ Fitness_Technique_Score1/
 
 ### 环境要求
 - **操作系统**：Windows 10 / 11（Tkinter 与 MediaPipe 在 Windows 下测试最稳；理论上 Linux / macOS 也可跑）
-- **Python**：建议 **3.10 – 3.12**（MediaPipe 官方 wheel 对 Python 版本敏感，3.13+ 暂未提供预编译包）
+- **Python**：64 位 Python；MediaPipe wheel 随版本变化，请确认当前版本提供对应 wheel。当前 Windows 构建使用 Python 3.13.14，依赖见 `requirements-build.txt`。
 - **摄像头**：笔记本内置摄像头或 USB 摄像头（程序默认打开 `cv2.VideoCapture(0)`）
 
 ### 安装依赖
@@ -162,11 +162,7 @@ pip install pyinstaller
 ```bash
 python main.py
 ```
-`main.py` 会做三件事：
-1. 以子进程方式启动 `server.py`（监听 127.0.0.1:8888）；
-2. 等待 1.5 秒让推理模型加载完毕；
-3. 启动 `gui.py` 弹出登录窗口；
-4. 关闭 GUI 后自动 terminate 后端进程。
+`main.py` 启动 Tkinter 界面；界面在后台线程中启动 Socket/MediaPipe 服务，关闭窗口后后台线程随进程退出。
 
 也可以分两个终端手动跑，便于调试：
 ```bash
@@ -174,12 +170,13 @@ python server.py     # 终端 1：后端
 python gui.py        # 终端 2：前端
 ```
 
-### 方式二：打包成 exe
+### 方式二：打包成 exe 和 ZIP
 ```bash
-pyinstaller FitnessScore.spec
+pyinstaller --noconfirm FitnessScore.spec
 ```
-打包产物在 `dist/FitnessScore/` 目录下。
-> 注意：打包时 `pose_landmarker_full.task`、`face_landmarker.task`、`app.ico` **不会被塞进 exe**，必须和 `FitnessScore.exe` 放在同一目录（代码里通过 `sys.executable` 同级目录读取）。
+打包产物在 `dist/FitnessScore/` 目录下。目录内包含 `FitnessScore.exe`、程序图标、MediaPipe 模型、背景图、音效和运行库；将该目录内容压缩为 ZIP 后，解压即可运行 `FitnessScore.exe`。
+
+PyInstaller 使用 onedir 形式，启动时不需要先解压数百 MB 到临时目录，模型和音效资源与 exe 放在同一目录。
 
 ---
 
@@ -238,7 +235,7 @@ A：确认两个 `.task` 模型文件和脚本在同一目录；打包后要和 
 A：检查是否有其他程序占用摄像头；`cv2.VideoCapture(0)` 的 `0` 是默认设备号，多摄像头时可改成 `1`、`2` 试一下。Windows 设置里要允许本应用访问摄像头。
 
 **Q：MediaPipe 装不上？**
-A：先确认 Python 版本在 3.10–3.12 之间、64 位系统；然后 `pip install mediapipe`。不要用 3.13+，官方还没出对应 wheel。
+A：使用 64 位 Python，并确认当前 MediaPipe 版本提供对应 Python/Windows wheel；按需固定依赖版本。当前 Windows 构建依赖见 `requirements-build.txt`，已用 Python 3.13.14 打包验证。
 
 **Q：引体向上一直不计数？**
 A：确认摄像头能拍到完整手臂（手腕要在肩膀上方），并保持约 1 秒等系统提示"抓杆成功"；拉起来时鼻子要明显高于肩膀连线。
