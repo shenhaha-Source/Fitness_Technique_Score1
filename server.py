@@ -37,6 +37,15 @@ from db import (
     PULL_UP_FULL, SQUAT_FULL, PUSHUP_FULL
 )
 
+# Keep Windows console startup safe when the active code page cannot encode
+# the status messages emitted while the database and models initialize.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
 HOST = "127.0.0.1"
 PORT = 8888
 
@@ -255,13 +264,13 @@ def recv_exact(conn, n: int) -> bytes:
     """
     精确读取 n 个字节，防止粘包。
     """
-    data = b""
+    data = bytearray()
     while len(data) < n:
         chunk = conn.recv(n - len(data))
         if not chunk:
             return None
-        data += chunk
-    return data
+        data.extend(chunk)
+    return bytes(data)
 
 
 def send_json(conn, obj: dict):

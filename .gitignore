@@ -1,6 +1,6 @@
 build/
 dist/
-*.spec
+*Debug.spec
 .idea/
 __pycache__/
 *.pyc
