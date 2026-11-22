@@ -14,6 +14,8 @@
 - 总分 = 三项平均分
 """
 
+import math
+
 import cv2
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -220,6 +222,8 @@ class BaseTestPage(BgFrame):
     测试页基类，封装通用的摄像头、开始/停止、画面渲染逻辑。
     """
 
+    result_label = ""
+
     def __init__(self, parent, sv: StudentView, title: str, color: str, test_type: int, image_mode: int):
         super().__init__(parent)
         self.sv = sv
@@ -229,7 +233,9 @@ class BaseTestPage(BgFrame):
         self.cap = None
         self.imgtk = None
         self.auto_stopped = False  # 是否自动停止（引体向上掉落）
-        self._last_count = 0
+        self._frame_callback = None
+        self._display_count = 0
+        self._display_score = None
         self._target = {
             TEST_PULL_UP: 15,
             TEST_SQUAT: 30,
@@ -326,7 +332,8 @@ class BaseTestPage(BgFrame):
             return
 
         self.is_running = True
-        self._last_count = 0
+        self._display_count = 0
+        self._display_score = None
         self.hint.config(text="")
 
         # 所有测试页（包括颜值页）都有开始提示；颜值页只是不播计数音
@@ -339,6 +346,9 @@ class BaseTestPage(BgFrame):
         """停止测试"""
         was_running = self.is_running
         self.is_running = False
+        if self._frame_callback is not None:
+            self.after_cancel(self._frame_callback)
+            self._frame_callback = None
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -349,8 +359,7 @@ class BaseTestPage(BgFrame):
             self.sv.audio.play("stop")
 
     def on_start(self):
-        """子类可重写：开始测试时的初始化"""
-        pass
+        self.render_result()
 
     def on_stop(self):
         """子类可重写：停止测试后的处理"""
@@ -358,6 +367,7 @@ class BaseTestPage(BgFrame):
 
     def update_frame(self):
         """逐帧更新画面，保持视频原始比例不变形"""
+        self._frame_callback = None
         if not self.is_running:
             return
         ret, frame = self.cap.read()
@@ -369,18 +379,20 @@ class BaseTestPage(BgFrame):
             self.stop()
             return
 
+        self.hint.config(text=res.get("tip", ""))
+        if res.get("success"):
+            self.on_frame_result(res, frame)
+
         # 检查是否自动停止（引体向上掉落）
         if res.get("auto_stop") and not self.auto_stopped:
             self.auto_stopped = True
-            count = res.get("count", 0)
-            score = res.get("score") or 0
             # 先停测试并播结束音，再弹提示
             self.stop()
-            messagebox.showinfo("测试结束", f"已掉落，测试结束！\n完成次数：{count}\n得分：{score:.0f}分")
+            messagebox.showinfo(
+                "测试结束",
+                f"已掉落，测试结束！\n完成次数：{self._display_count}\n得分：{self._display_score or 0:.0f}分",
+            )
             return
-
-        self._handle_audio(res)
-        self.on_frame_result(res, frame)
 
         # 等比例缩放显示，不拉伸变形
         w, h = self.img_label.winfo_width(), self.img_label.winfo_height()
@@ -401,91 +413,56 @@ class BaseTestPage(BgFrame):
             img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
             self.imgtk = ImageTk.PhotoImage(img)
             self.img_label.config(image=self.imgtk, text="")
-        self.after(15, self.update_frame)
-
-    def _handle_audio(self, res: dict):
-        """
-        只在“检测到人 + 计数增加”时出声。
-
-        服务端在无人/出画时会返回 success=False、count=0，
-        这里必须跳过，否则人回到画面时会把旧计数当成新动作重复响。
-        """
-        if self.test_type == TEST_FACE:
-            return
-        if not res.get("success"):
-            return
-
-        try:
-            count = int(res.get("count", 0) or 0)
-        except (TypeError, ValueError):
-            return
-
-        if count < self._last_count:
-            self._last_count = count
-            return
-
-        cue = select_count_cue(self._last_count, count, self._target)
-        if cue:
-            self.sv.audio.play(cue)
-        self._last_count = count
+        self._frame_callback = self.after(15, self.update_frame)
 
     def on_frame_result(self, res: dict, frame):
-        """子类可重写：处理后端返回的帧结果"""
-        pass
+        """接受有效结果，保留本轮最高的显示数值。"""
+        count = res.get("count")
+        if self.test_type != TEST_FACE and isinstance(count, int) and count > self._display_count:
+            cue = select_count_cue(self._display_count, count, self._target)
+            self._display_count = count
+            if cue:
+                self.sv.audio.play(cue)
+
+        score = res.get("score")
+        if isinstance(score, (int, float)) and math.isfinite(score) and score >= 0:
+            if self._display_score is None or score > self._display_score:
+                self._display_score = score
+        self.render_result()
+
+    def render_result(self):
+        score = self._display_score or 0
+        self.info.config(text=f"{self.result_label}：{self._display_count}个 | 得分：{score:.0f}分")
 
 
 # ---------------------- 引体向上测试 ----------------------
 class PullUpTestPage(BaseTestPage):
     """引体向上计数测试页（掉落自动停止）"""
 
+    result_label = "引体向上"
+
     def __init__(self, parent, sv: StudentView):
         super().__init__(parent, sv, "💪 引体向上计数测试", PRIMARY, TEST_PULL_UP, image_mode=0)
-
-    def on_start(self):
-        self.info.config(text="引体向上：0个 | 得分：0分")
-
-    def on_frame_result(self, res: dict, frame):
-        tip = res.get("tip", "")
-        count = res.get("count", 0)
-        score = res.get("score") or 0
-        self.info.config(text=f"引体向上：{count}个 | 得分：{score:.0f}分")
-        self.hint.config(text=tip)
 
 
 # ---------------------- 深蹲测试 ----------------------
 class SquatTestPage(BaseTestPage):
     """深蹲计数测试页"""
 
+    result_label = "深蹲"
+
     def __init__(self, parent, sv: StudentView):
         super().__init__(parent, sv, "🏃 深蹲计数测试", PRIMARY, TEST_SQUAT, image_mode=0)
-
-    def on_start(self):
-        self.info.config(text="深蹲：0个 | 得分：0分")
-
-    def on_frame_result(self, res: dict, frame):
-        tip = res.get("tip", "")
-        count = res.get("count", 0)
-        score = res.get("score") or 0
-        self.info.config(text=f"深蹲：{count}个 | 得分：{score:.0f}分")
-        self.hint.config(text=tip)
 
 
 # ---------------------- 俯卧撑测试 ----------------------
 class PushupTestPage(BaseTestPage):
     """俯卧撑计数测试页"""
 
+    result_label = "俯卧撑"
+
     def __init__(self, parent, sv: StudentView):
         super().__init__(parent, sv, "🤸 俯卧撑计数测试", PRIMARY, TEST_PUSHUP, image_mode=0)
-
-    def on_start(self):
-        self.info.config(text="俯卧撑：0个 | 得分：0分")
-
-    def on_frame_result(self, res: dict, frame):
-        tip = res.get("tip", "")
-        count = res.get("count", 0)
-        score = res.get("score") or 0
-        self.info.config(text=f"俯卧撑：{count}个 | 得分：{score:.0f}分")
-        self.hint.config(text=tip)
 
 
 # ---------------------- 颜值趣味测评 ----------------------
@@ -495,18 +472,15 @@ class FaceScorePage(BaseTestPage):
     def __init__(self, parent, sv: StudentView):
         super().__init__(parent, sv, "✨ 颜值比例趣味测评", ACCENT, TEST_FACE, image_mode=1)
 
-    def on_start(self):
-        self.info.config(text="颜值分数：计算中...")
-
     def on_stop(self):
-        self.info.config(text="颜值分数：--")
+        if self._display_score is None:
+            self.info.config(text="颜值分数：--")
 
-    def on_frame_result(self, res: dict, frame):
-        tip = res.get("tip", "")
-        score = res.get("score")
-        if score is not None:
-            self.info.config(text=f"颜值分数：{score:.1f}（趣味，不计入成绩）")
-        self.hint.config(text=tip)
+    def render_result(self):
+        if self._display_score is None:
+            self.info.config(text="颜值分数：计算中...")
+        else:
+            self.info.config(text=f"颜值分数：{self._display_score:.1f}（趣味，不计入成绩）")
 
 
 # ---------------------- 我的成绩 ----------------------

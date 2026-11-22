@@ -29,6 +29,7 @@ import numpy as np
 import threading
 import os
 import sys
+import time
 
 from db import (
     init_db, add_user, login_user, create_session, check_session,
@@ -42,25 +43,31 @@ PORT = 8888
 
 # ========== 业务参数阈值 ==========
 # 引体向上
-PULL_UP_UP_Y_THRESH = 0.03   # 鼻子比肩线高多少算拉起到位
-PULL_UP_DOWN_Y_THRESH = 0.02 # 鼻子比肩线低多少算下放到位
-PULL_UP_GRIP_RATIO = 0.02    # 手腕比肩膀高多少算抓杆
-PULL_UP_STRAIGHT_ANGLE = 130.0 # 手肘角度大于此值 = 手臂伸直（放宽到130°）
+PULL_UP_TOP_MARGIN = 0.06   # 拉起时允许鼻尖略低于手腕线
+PULL_UP_GRIP_RATIO = 0.015  # 手腕高于肩膀的最小距离
+PULL_UP_BENT_ANGLE = 110.0  # 拉起时双肘平均角度上限
+PULL_UP_STRAIGHT_ANGLE = 120.0  # 下放时双肘各自的角度下限
 PU_DEBOUNCE_FRAMES = 2        # 连续多少帧满足条件才切换状态（放宽到2帧）
 PU_FALL_FRAMES = 5            # 连续多少帧检测不到抓杆 = 掉落
-PU_GRIP_CONFIRM_FRAMES = 20   # 连续多少帧保持抓杆才算真的跳上去了
+PU_GRIP_CONFIRM_FRAMES = 8    # 连续确认抓杆的帧数
 STATE_PU_WAIT = "wait"        # 等待抓杆（初始状态，人在地面）
 STATE_PU_READY = "ready"      # 抓杆、手臂伸直（基准状态）
-STATE_PU_UP = "up"            # 拉起，下巴过杆
+STATE_PU_UP = "up"            # 拉起到位
 
 # 深蹲
-SQUAT_THRESHOLD = 0.08     # 髋膝y坐标差阈值
+SQUAT_DOWN_ANGLE = 135.0    # 膝关节角度达到此值或更小，允许浅蹲
+SQUAT_STAND_ANGLE = 155.0   # 膝关节角度达到此值或更大，视为起立
+SQUAT_CONFIRM_MARGIN = 8.0  # 第二帧的角度容差
+SQUAT_MIN_VISIBILITY = 0.5
+SQUAT_TRACKING_TIMEOUT = 0.8  # 丢失跟踪后重新确认站姿的时间（秒）
+SQUAT_LEGS = ((23, 25, 27), (24, 26, 28))
+STATE_SQUAT_WAIT = "wait"
 STATE_STAND = "stand"
 STATE_SQUAT = "squat"
 
 # 俯卧撑
-PUSHUP_DOWN_ANGLE = 90.0   # 手肘角度小于此值 = 下去了
-PUSHUP_UP_ANGLE = 160.0    # 手肘角度大于此值 = 上来了
+PUSHUP_DOWN_ANGLE = 110.0  # 手肘角度达到此值或更小 = 下压到位
+PUSHUP_UP_ANGLE = 145.0    # 手肘角度达到此值或更大 = 撑起到位
 STATE_UP = "up"
 STATE_DOWN = "down"
 
@@ -150,6 +157,25 @@ def calc_angle(a: dict, b: dict, c: dict) -> float:
     return np.degrees(angle)
 
 
+def squat_knee_angles(landmarks):
+    """用可见腿的三维髋、膝、踝坐标计算膝角。"""
+    if len(landmarks) < 29:
+        return []
+    angles = []
+    for indices in SQUAT_LEGS:
+        hip, knee, ankle = (landmarks[i] for i in indices)
+        if not all(point.visibility is not None and point.visibility >= SQUAT_MIN_VISIBILITY
+                   for point in (hip, knee, ankle)):
+            continue
+        thigh = np.array([hip.x - knee.x, hip.y - knee.y, hip.z - knee.z])
+        shin = np.array([ankle.x - knee.x, ankle.y - knee.y, ankle.z - knee.z])
+        length = np.linalg.norm(thigh) * np.linalg.norm(shin)
+        if length > 0 and np.isfinite(length):
+            cosine = np.dot(thigh, shin) / length
+            angles.append(np.degrees(np.arccos(np.clip(cosine, -1, 1))))
+    return angles
+
+
 def calc_face_score(lm: list) -> float:
     """
     计算颜值比例趣味评分（基于面部关键点几何比例）。
@@ -199,8 +225,10 @@ class SessionState:
         self.pu_tip_text = ""       # 要显示的提示文字
 
         # 深蹲状态
-        self.squat_state = STATE_STAND
+        self.squat_state = STATE_SQUAT_WAIT
         self.squat_count = 0
+        self.squat_previous_angle = None
+        self.squat_last_pose_at = None
 
         # 俯卧撑状态
         self.pushup_state = STATE_UP
@@ -223,29 +251,66 @@ class SessionState:
         self.pu_debounce = 0
         self.pu_tip_timer = 0
         self.pu_tip_text = ""
-        self.squat_state = STATE_STAND
+        self.squat_state = STATE_SQUAT_WAIT
         self.squat_count = 0
+        self.squat_previous_angle = None
+        self.squat_last_pose_at = None
         self.pushup_state = STATE_UP
         self.pushup_count = 0
         self.last_face_score = None
 
-    def stop_test(self):
-        """
-        结束当前测试，返回 (测试名称, 计数, 分数)。
-        """
-        result = None
+    def update_squat(self, landmarks):
+        """确认站立、下蹲、重新站立，完成一轮才加一。"""
+        now = time.monotonic()
+        angles = squat_knee_angles(landmarks)
+        if self.squat_last_pose_at is not None and now - self.squat_last_pose_at >= SQUAT_TRACKING_TIMEOUT:
+            self.squat_state = STATE_SQUAT_WAIT
+            self.squat_previous_angle = None
+        if not angles:
+            self.squat_previous_angle = None
+            return False
+        self.squat_last_pose_at = now
+        previous = self.squat_previous_angle
+
+        if self.squat_state == STATE_STAND:
+            angle = max(angles)
+            if (previous is not None
+                    and min(angle, previous) <= SQUAT_DOWN_ANGLE
+                    and max(angle, previous) <= SQUAT_DOWN_ANGLE + SQUAT_CONFIRM_MARGIN):
+                self.squat_state = STATE_SQUAT
+                self.squat_previous_angle = None
+                return True
+        else:
+            angle = min(angles)
+            if (previous is not None
+                    and max(angle, previous) >= SQUAT_STAND_ANGLE
+                    and min(angle, previous) >= SQUAT_STAND_ANGLE - SQUAT_CONFIRM_MARGIN):
+                if self.squat_state == STATE_SQUAT:
+                    self.squat_count += 1
+                self.squat_state = STATE_STAND
+                self.squat_previous_angle = None
+                return True
+        self.squat_previous_angle = angle
+        return True
+
+    def test_result(self):
+        """读取当前测试的名称、计数和分数。"""
         if self.current_test == TEST_PULL_UP:
             score = count_to_score(self.pu_count, PULL_UP_FULL)
-            result = ("引体向上计数测试", self.pu_count, score)
-        elif self.current_test == TEST_SQUAT:
+            return ("引体向上计数测试", self.pu_count, score)
+        if self.current_test == TEST_SQUAT:
             score = count_to_score(self.squat_count, SQUAT_FULL)
-            result = ("深蹲计数测试", self.squat_count, score)
-        elif self.current_test == TEST_PUSHUP:
+            return ("深蹲计数测试", self.squat_count, score)
+        if self.current_test == TEST_PUSHUP:
             score = count_to_score(self.pushup_count, PUSHUP_FULL)
-            result = ("俯卧撑计数测试", self.pushup_count, score)
-        elif self.current_test == TEST_FACE:
-            if self.last_face_score is not None:
-                result = ("颜值比例测评", None, round(self.last_face_score, 1))
+            return ("俯卧撑计数测试", self.pushup_count, score)
+        if self.current_test == TEST_FACE and self.last_face_score is not None:
+            return ("颜值比例测评", None, round(self.last_face_score, 1))
+        return None
+
+    def stop_test(self):
+        """结束测试并返回最后的成绩。"""
+        result = self.test_result()
         self.current_test = None
         return result
 
@@ -493,31 +558,47 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
         return
 
     arr = np.frombuffer(img_data, dtype=np.uint8)
-    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR) if arr.size else None
+    response = {"success": False, "tip": "未检测到", "count": 0, "score": None, "auto_stop": False}
+    if mode == 0:
+        result = session.test_result()
+        if result is not None and result[1] is not None:
+            _, response["count"], response["score"] = result
+
     if frame is None:
-        send_json(conn, {"success": False, "tip": "图像解码失败"})
+        if mode == 0 and session.current_test == TEST_SQUAT:
+            session.update_squat(())
+        response["tip"] = "图像解码失败"
+        send_json(conn, response)
         return
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    response = {"success": False, "tip": "未检测到", "count": 0, "score": None, "auto_stop": False}
-
     if mode == 0:
         # ===== 姿态识别 =====
         res = pose_detector.detect(mp_image)
-        if res.pose_landmarks:
+        if session.current_test == TEST_SQUAT:
+            poses = res.pose_world_landmarks
+            if session.update_squat(poses[0] if poses else ()):
+                _, count, score = session.test_result()
+                response.update(success=True, count=count, score=score)
+                if session.squat_state == STATE_SQUAT_WAIT:
+                    response["tip"] = "请先站直，准备开始深蹲。"
+                elif session.squat_state == STATE_SQUAT:
+                    response["tip"] = "下蹲已识别，起身后计数。"
+                else:
+                    response["tip"] = "屈膝下蹲，再站起完成一次。"
+            else:
+                response["tip"] = "请确保摄像头能看到髋部、膝盖和脚踝。"
+        elif res.pose_landmarks:
             lm = res.pose_landmarks[0]
             lm_list = [{"x": p.x, "y": p.y, "z": p.z} for p in lm]
-            response["success"] = True
-
             # 引体向上计数
             if session.current_test == TEST_PULL_UP and len(lm_list) >= 17:
+                response["success"] = True
                 # 如果已经因掉落停止，直接返回
                 if session.pu_stopped:
-                    current_score = count_to_score(session.pu_count, PULL_UP_FULL)
-                    response["count"] = session.pu_count
-                    response["score"] = current_score
                     response["tip"] = "⚠️ 已掉落，测试结束"
                     response["auto_stop"] = True
                     send_json(conn, response)
@@ -537,8 +618,7 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 # 计算左右手肘角度，判断手臂是否伸直
                 l_arm_angle = calc_angle(l_shoulder, l_elbow, l_wrist)
                 r_arm_angle = calc_angle(r_shoulder, r_elbow, r_wrist)
-                arm_straight = (l_arm_angle > PULL_UP_STRAIGHT_ANGLE and
-                                r_arm_angle > PULL_UP_STRAIGHT_ANGLE)
+                arm_straight = min(l_arm_angle, r_arm_angle) >= PULL_UP_STRAIGHT_ANGLE
 
                 # 判断是否抓杆：手腕高于肩膀
                 is_grip = wrist_y < shoulder_y - PULL_UP_GRIP_RATIO
@@ -546,12 +626,10 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 # 掉落检测：只有已经开始抓杆之后，才检测掉落
                 if session.pu_grip_started:
                     if not is_grip:
+                        session.pu_debounce = 0
                         session.pu_fall_counter += 1
                         if session.pu_fall_counter >= PU_FALL_FRAMES:
                             session.pu_stopped = True
-                            current_score = count_to_score(session.pu_count, PULL_UP_FULL)
-                            response["count"] = session.pu_count
-                            response["score"] = current_score
                             response["tip"] = "⚠️ 已掉落，测试结束！"
                             response["auto_stop"] = True
                             send_json(conn, response)
@@ -563,7 +641,7 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                     if is_grip and arm_straight:
                         # 连续保持抓杆+手臂伸直，确认真的抓杆了
                         session.pu_grip_confirm += 1
-                        if session.pu_grip_confirm >= PU_GRIP_CONFIRM_FRAMES:  # 连续多帧才算真抓杆
+                        if session.pu_grip_confirm >= PU_GRIP_CONFIRM_FRAMES:
                             session.pu_grip_started = True
                             session.pu_state = STATE_PU_READY
                             session.pu_debounce = 0
@@ -575,11 +653,10 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                         session.pu_grip_confirm = 0
 
                 # 状态机（只有开始抓杆后才计数）
-                if session.pu_grip_started:
-                    # 判定是否拉起到位：鼻子比肩线高（上拉时手臂自然弯曲，不做限制）
-                    is_up = nose["y"] < shoulder_y - PULL_UP_UP_Y_THRESH
-                    # 判定是否下放到位：鼻子比肩线低 且 手臂伸直（回到悬垂起点）
-                    is_down = nose["y"] > shoulder_y + PULL_UP_DOWN_Y_THRESH and arm_straight
+                if session.pu_grip_started and is_grip:
+                    mean_elbow_angle = (l_arm_angle + r_arm_angle) / 2
+                    is_up = (nose["y"] <= wrist_y + PULL_UP_TOP_MARGIN and
+                             mean_elbow_angle <= PULL_UP_BENT_ANGLE)
 
                     if session.pu_state == STATE_PU_READY:
                         # 基准状态：手臂伸直悬垂，看是否拉起到位
@@ -594,11 +671,11 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
 
                     elif session.pu_state == STATE_PU_UP:
                         # 拉起状态，看是否下放回到基准（必须手臂伸直）
-                        if is_down:
+                        if arm_straight:
                             session.pu_debounce += 1
                             if session.pu_debounce >= PU_DEBOUNCE_FRAMES:
                                 session.pu_count += 1
-                                response["tip"] = f"✅ 完成第{session.pu_count}个！"
+                                response["tip"] = "✅ 完成一次引体向上！"
                                 session.pu_state = STATE_PU_READY
                                 session.pu_debounce = 0
                         else:
@@ -611,54 +688,35 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
 
                 # 拼接提示文本
                 if not session.pu_grip_started:
-                    response["tip"] = "请跳上去抓杆（双手举过肩+手臂伸直保持1秒）..."
+                    response["tip"] = "请抓杆，双手举过肩并稍停，等待确认。"
                 elif session.pu_tip_timer > 0:
                     # 显示抓杆成功提示，持续2秒
                     response["tip"] = session.pu_tip_text
                     session.pu_tip_timer -= 1
-                response["tip"] += f" | 分数:{current_score:.0f}"
-
-            # 深蹲计数
-            elif session.current_test == TEST_SQUAT and len(lm_list) >= 27:
-                l_hip = lm_list[23]
-                r_hip = lm_list[24]
-                l_knee = lm_list[25]
-                r_knee = lm_list[26]
-                hip_y = (l_hip["y"] + r_hip["y"]) / 2
-                knee_y = (l_knee["y"] + r_knee["y"]) / 2
-
-                if session.squat_state == STATE_STAND:
-                    if knee_y > hip_y + SQUAT_THRESHOLD:
-                        session.squat_state = STATE_SQUAT
-                elif session.squat_state == STATE_SQUAT:
-                    if knee_y < hip_y - SQUAT_THRESHOLD:
-                        session.squat_count += 1
-                        session.squat_state = STATE_STAND
-
-                current_score = count_to_score(session.squat_count, SQUAT_FULL)
-                response["score"] = current_score
-                response["count"] = session.squat_count
-                response["tip"] = f"深蹲:{session.squat_count}个 | 分数:{current_score:.0f}"
+                elif response["tip"] == "未检测到":
+                    response["tip"] = "请继续拉起或下放。"
 
             # 俯卧撑计数
             elif session.current_test == TEST_PUSHUP and len(lm_list) >= 16:
+                response["success"] = True
                 l_shoulder = lm_list[11]
                 l_elbow = lm_list[13]
                 l_wrist = lm_list[15]
                 angle = calc_angle(l_shoulder, l_elbow, l_wrist)
 
                 if session.pushup_state == STATE_UP:
-                    if angle < PUSHUP_DOWN_ANGLE:
+                    if angle <= PUSHUP_DOWN_ANGLE:
                         session.pushup_state = STATE_DOWN
                 elif session.pushup_state == STATE_DOWN:
-                    if angle > PUSHUP_UP_ANGLE:
+                    if angle >= PUSHUP_UP_ANGLE:
                         session.pushup_count += 1
                         session.pushup_state = STATE_UP
 
                 current_score = count_to_score(session.pushup_count, PUSHUP_FULL)
                 response["score"] = current_score
                 response["count"] = session.pushup_count
-                response["tip"] = f"俯卧撑:{session.pushup_count}个 | 分数:{current_score:.0f}"
+                response["tip"] = ("撑起后计数。" if session.pushup_state == STATE_DOWN
+                                   else "下压后再撑起。")
 
     else:
         # ===== 人脸识别 =====
@@ -673,7 +731,7 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 if score is not None:
                     session.last_face_score = score
                     response["score"] = round(score, 1)
-                    response["tip"] = f"分数：{score:.1f}"
+                    response["tip"] = "已识别人脸。"
 
     send_json(conn, response)
 
