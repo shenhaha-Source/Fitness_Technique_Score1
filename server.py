@@ -63,7 +63,9 @@ STATE_PU_READY = "ready"      # 抓杆、手臂伸直（基准状态）
 STATE_PU_UP = "up"            # 拉起，下巴过杆
 
 # 深蹲
-SQUAT_THRESHOLD = 0.08     # 髋膝y坐标差阈值
+SQUAT_DOWN_ANGLE = 110.0   # 膝角小于此值进入下蹲状态
+SQUAT_UP_ANGLE = 155.0    # 膝角恢复到此值后完成一次深蹲
+LANDMARK_VISIBILITY_MIN = 0.5
 STATE_STAND = "stand"
 STATE_SQUAT = "squat"
 
@@ -72,6 +74,7 @@ PUSHUP_DOWN_ANGLE = 90.0   # 手肘角度小于此值 = 下去了
 PUSHUP_UP_ANGLE = 160.0    # 手肘角度大于此值 = 上来了
 STATE_UP = "up"
 STATE_DOWN = "down"
+STATE_PUSHUP_WAIT_UP = "wait_up"
 
 # 测试类型枚举
 TEST_PULL_UP = 0      # 引体向上（替换原来的拍手）
@@ -212,7 +215,7 @@ class SessionState:
         self.squat_count = 0
 
         # 俯卧撑状态
-        self.pushup_state = STATE_UP
+        self.pushup_state = STATE_PUSHUP_WAIT_UP
         self.pushup_count = 0
 
         # 颜值
@@ -234,9 +237,28 @@ class SessionState:
         self.pu_tip_text = ""
         self.squat_state = STATE_STAND
         self.squat_count = 0
-        self.pushup_state = STATE_UP
+        self.pushup_state = STATE_PUSHUP_WAIT_UP
         self.pushup_count = 0
         self.last_face_score = None
+
+    def current_count(self):
+        """Return the stored count for the active exercise, including on missed frames."""
+        if self.current_test == TEST_PULL_UP:
+            return self.pu_count
+        if self.current_test == TEST_SQUAT:
+            return self.squat_count
+        if self.current_test == TEST_PUSHUP:
+            return self.pushup_count
+        return 0
+
+    def current_score(self):
+        if self.current_test == TEST_PULL_UP:
+            return count_to_score(self.pu_count, PULL_UP_FULL)
+        if self.current_test == TEST_SQUAT:
+            return count_to_score(self.squat_count, SQUAT_FULL)
+        if self.current_test == TEST_PUSHUP:
+            return count_to_score(self.pushup_count, PUSHUP_FULL)
+        return None
 
     def stop_test(self):
         """
@@ -279,6 +301,40 @@ def send_json(conn, obj: dict):
     """
     send_buf = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
     conn.sendall(send_buf)
+
+
+def _landmark_visibility(point: dict) -> float:
+    """Use confidence when supplied; unsupported confidence fields must not hide a point."""
+    value = point.get("visibility")
+    if value is None:
+        value = point.get("presence")
+    if value is None:
+        return 1.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _visible_indices(landmarks: list, indices: tuple) -> bool:
+    return all(
+        index < len(landmarks)
+        and _landmark_visibility(landmarks[index]) >= LANDMARK_VISIBILITY_MIN
+        for index in indices
+    )
+
+
+def _visible_joint_angles(landmarks: list, triplets: tuple) -> list:
+    angles = []
+    for a, b, c in triplets:
+        if _visible_indices(landmarks, (a, b, c)):
+            confidence = min(
+                _landmark_visibility(landmarks[a]),
+                _landmark_visibility(landmarks[b]),
+                _landmark_visibility(landmarks[c]),
+            )
+            angles.append((confidence, calc_angle(landmarks[a], landmarks[b], landmarks[c])))
+    return sorted(angles, reverse=True)
 
 
 def recv_json(conn) -> dict:
@@ -492,6 +548,13 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
     """
     处理图像帧：姿态识别/人脸识别 + 计数。
     """
+    response = {
+        "success": False,
+        "tip": "未检测到完整姿态，请将本项目所需部位放入画面",
+        "count": session.current_count(),
+        "score": session.current_score(),
+        "auto_stop": False,
+    }
     len_buf = recv_exact(conn, 4)
     if len_buf is None:
         return
@@ -504,20 +567,48 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
     arr = np.frombuffer(img_data, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if frame is None:
-        send_json(conn, {"success": False, "tip": "图像解码失败"})
+        response["tip"] = "图像解码失败"
+        send_json(conn, response)
         return
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-    response = {"success": False, "tip": "未检测到", "count": 0, "score": None, "auto_stop": False}
 
     if mode == 0:
         # ===== 姿态识别 =====
         res = pose_detector.detect(mp_image)
         if res.pose_landmarks:
             lm = res.pose_landmarks[0]
-            lm_list = [{"x": p.x, "y": p.y, "z": p.z} for p in lm]
+            lm_list = [
+                {
+                    "x": p.x,
+                    "y": p.y,
+                    "z": p.z,
+                    "visibility": getattr(p, "visibility", None),
+                    "presence": getattr(p, "presence", None),
+                }
+                for p in lm
+            ]
+
+            if session.current_test == TEST_PULL_UP and not _visible_indices(
+                lm_list, (0, 11, 12, 13, 14, 15, 16)
+            ):
+                response["tip"] = "请让头部、双肩、双肘和双腕完整入镜"
+                send_json(conn, response)
+                return
+            if session.current_test == TEST_SQUAT and not _visible_joint_angles(
+                lm_list, ((23, 25, 27), (24, 26, 28))
+            ):
+                response["tip"] = "请将髋部、膝盖和脚踝完整入镜，并侧身对准摄像头"
+                send_json(conn, response)
+                return
+            if session.current_test == TEST_PUSHUP and not _visible_joint_angles(
+                lm_list, ((11, 13, 15), (12, 14, 16))
+            ):
+                response["tip"] = "请将至少一侧肩膀、肘部和手腕完整入镜"
+                send_json(conn, response)
+                return
+
             response["success"] = True
 
             # 引体向上计数
@@ -628,35 +719,42 @@ def _handle_image_frame(conn, session: SessionState, mode: int):
                 response["tip"] += f" | 分数:{current_score:.0f}"
 
             # 深蹲计数
-            elif session.current_test == TEST_SQUAT and len(lm_list) >= 27:
-                l_hip = lm_list[23]
-                r_hip = lm_list[24]
-                l_knee = lm_list[25]
-                r_knee = lm_list[26]
-                hip_y = (l_hip["y"] + r_hip["y"]) / 2
-                knee_y = (l_knee["y"] + r_knee["y"]) / 2
+            elif session.current_test == TEST_SQUAT and len(lm_list) >= 29:
+                angles = _visible_joint_angles(lm_list, ((23, 25, 27), (24, 26, 28)))
+                if not angles:
+                    response["success"] = False
+                    response["tip"] = "请将髋部、膝盖和脚踝完整入镜"
+                    send_json(conn, response)
+                    return
+                knee_angle = sum(angle for _, angle in angles) / len(angles)
 
                 if session.squat_state == STATE_STAND:
-                    if knee_y > hip_y + SQUAT_THRESHOLD:
+                    if knee_angle < SQUAT_DOWN_ANGLE:
                         session.squat_state = STATE_SQUAT
                 elif session.squat_state == STATE_SQUAT:
-                    if knee_y < hip_y - SQUAT_THRESHOLD:
+                    if knee_angle > SQUAT_UP_ANGLE:
                         session.squat_count += 1
                         session.squat_state = STATE_STAND
 
                 current_score = count_to_score(session.squat_count, SQUAT_FULL)
                 response["score"] = current_score
                 response["count"] = session.squat_count
-                response["tip"] = f"深蹲:{session.squat_count}个 | 分数:{current_score:.0f}"
+                response["tip"] = f"深蹲：{session.squat_count}个 | 膝角：{knee_angle:.0f}° | 分数：{current_score:.0f}"
 
             # 俯卧撑计数
             elif session.current_test == TEST_PUSHUP and len(lm_list) >= 16:
-                l_shoulder = lm_list[11]
-                l_elbow = lm_list[13]
-                l_wrist = lm_list[15]
-                angle = calc_angle(l_shoulder, l_elbow, l_wrist)
+                angles = _visible_joint_angles(lm_list, ((11, 13, 15), (12, 14, 16)))
+                if not angles:
+                    response["success"] = False
+                    response["tip"] = "请将至少一侧肩膀、肘部和手腕完整入镜"
+                    send_json(conn, response)
+                    return
+                angle = sum(value for _, value in angles) / len(angles)
 
-                if session.pushup_state == STATE_UP:
+                if session.pushup_state == STATE_PUSHUP_WAIT_UP:
+                    if angle > PUSHUP_UP_ANGLE:
+                        session.pushup_state = STATE_UP
+                elif session.pushup_state == STATE_UP:
                     if angle < PUSHUP_DOWN_ANGLE:
                         session.pushup_state = STATE_DOWN
                 elif session.pushup_state == STATE_DOWN:
